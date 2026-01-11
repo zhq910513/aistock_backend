@@ -1,0 +1,38 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: aistock
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build: .
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/aistock
+
+      # Market event ingestion source
+      THS_MODE: ${THS_MODE:-MOCK}
+
+      # Evidence collection provider (agent loop)
+      DATA_PROVIDER: ${DATA_PROVIDER:-IFIND_HTTP}
+
+      # iFinD HTTP
+      IFIND_HTTP_BASE_URL: ${IFIND_HTTP_BASE_URL:-https://quantapi.51ifind.com}
+      IFIND_HTTP_REFRESH_TOKEN: ${IFIND_HTTP_REFRESH_TOKEN:-}
+      IFIND_HTTP_TOKEN: ${IFIND_HTTP_TOKEN:-}
+
+      ORCH_SYMBOLS: ${ORCH_SYMBOLS:-000001.SZ,600000.SH}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
