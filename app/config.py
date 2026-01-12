@@ -1,77 +1,89 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from __future__ import annotations
+
 from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # --- Runtime / env ---
     ENV: str = "prod"
     TZ: str = "Asia/Shanghai"
+
+    # Reverse proxy prefix (Nginx mounts the API at /aistock/api/*)
+    API_ROOT_PATH: str = "/aistock/api"
+
+    # Orchestrator background loop is optional for API-only deployments/testing.
+    START_ORCHESTRATOR: bool = False
+
+    # --- Database ---
     DATABASE_URL: str = "sqlite:////app/db/aistock.sqlite3"
-    # --- Profit objective / horizon (1-3 days, 5-8%) ---
+
+    # --- Data sources ---
+    DATA_PROVIDER: str = "IFIND_HTTP"
+    THS_MODE: str = "MOCK"
+
+    IFIND_HTTP_BASE_URL: str = "https://quantapi.51ifind.com"
+    IFIND_HTTP_REFRESH_TOKEN: str = ""
+    IFIND_HTTP_TOKEN: str = ""
+
+    # --- Strategy / objectives ---
     HOLD_DAYS_MIN: int = 1
     HOLD_DAYS_MAX: int = 3
     TARGET_RETURN_MIN: float = 0.05
     TARGET_RETURN_MAX: float = 0.08
 
-    # --- Frozen daily versions ---
-    CANONICALIZATION_VERSION: str = "canon_v1"
-    RULESET_VERSION_HASH: str = "ruleset_dev_hash_001"
-    STRATEGY_CONTRACT_HASH: str = "contract_dev_hash_001"
-    MODEL_SNAPSHOT_UUID: str = "stable_model_001"
-    COST_MODEL_VERSION: str = "cost_v1"
-    FEATURE_EXTRACTOR_VERSION: str = "fx_v1"
+    # --- Orchestrator loop ---
+    ORCH_SYMBOLS: str = "000001.SZ,600000.SH"
+    ORCH_LOOP_INTERVAL_MS: int = 1000
 
-    # --- Anti-leakage ---
+    # --- Governance / gates ---
+    REQUIRE_SELF_CHECK_FOR_TRADING: bool = False
+    SELF_CHECK_MAX_AGE_SEC: int = 3600
+    SCHED_DRIFT_THRESHOLD_MS: int = 2000
     EPSILON_MIN_MS: int = 200
 
-    # --- Orchestrator ---
-    ORCH_SYMBOLS: str = "000001.SZ,600000.SH"
-    ORCH_LOOP_INTERVAL_MS: int = 750
-    SCHED_DRIFT_THRESHOLD_MS: int = 250  # drift event threshold
+    # --- Outbox ---
+    OUTBOX_MAX_ATTEMPTS: int = 8
+    OUTBOX_BACKOFF_BASE_MS: int = 200
+    OUTBOX_BACKOFF_MAX_MS: int = 5000
 
-    # --- THS adapter (market events source) ---
-    # MOCK / IFIND_HTTP
-    THS_MODE: str = "MOCK"
+    # --- Audit / shadow ---
+    SHADOW_LIVE_ENABLED: bool = False
+    POST_MARKET_RECONCILE_ENABLED: bool = False
 
-    # --- Data providers (agent loop evidence collection) ---
-    DATA_PROVIDER: str = "IFIND_HTTP"  # MOCK / IFIND_HTTP
+    # --- Versions (S³ invariants) ---
+    API_SCHEMA_VERSION: str = "dev"
+    RULESET_VERSION_HASH: str = "dev"
+    STRATEGY_CONTRACT_HASH: str = "dev"
+    MODEL_SNAPSHOT_UUID: str = "dev"
+    COST_MODEL_VERSION: str = "dev"
+    CANONICALIZATION_VERSION: str = "dev"
+    FEATURE_EXTRACTOR_VERSION: str = "dev"
 
-    # --- iFinD QuantAPI (HTTP) ---
-    IFIND_HTTP_BASE_URL: str = "https://quantapi.51ifind.com"
-    # Short-lived token (expires ~7 days). Prefer using refresh token.
-    IFIND_HTTP_TOKEN: str = ""
-    # Long-lived refresh token (aligned with account expiry). Used to obtain/refresh access_token.
-    IFIND_HTTP_REFRESH_TOKEN: str = ""
-    # If we don't know the token expiry precisely, we can still proactively refresh on a cadence.
-    IFIND_HTTP_TOKEN_MAX_AGE_SEC: int = 6 * 24 * 3600  # 6 days (safety buffer vs 7 days)
-    IFIND_HTTP_TOKEN_EARLY_REFRESH_SEC: int = 15 * 60  # refresh early when nearing max-age
+    # --- Accounts ---
+    DEFAULT_ACCOUNT_ID: str = "SIM-PRIMARY"
+    ACCOUNT_IDS: str = ""
 
-    # --- Multi-account (execution plane) ---
-    DEFAULT_ACCOUNT_ID: str = "ACC_PRIMARY"
-    ACCOUNT_IDS: str = "ACC_PRIMARY"  # comma-separated known accounts
-    MAX_CONCURRENT_POSITIONS_PER_ACCOUNT: int = 10
+    # --- Agent limits ---
+    AGENT_MAX_REQUESTS_PER_SYMBOL: int = 4
+    AGENT_VERIFY_MIN_CONFIDENCE: float = 0.55
 
-    # --- Governance: trade gate ---
-    REQUIRE_SELF_CHECK_FOR_TRADING: bool = True
-    SELF_CHECK_MAX_AGE_SEC: int = 3600  # 1h
-
-    # --- Outbox retry policy (deterministic) ---
-    OUTBOX_MAX_ATTEMPTS: int = 12
-    OUTBOX_BACKOFF_BASE_MS: int = 250
-    OUTBOX_BACKOFF_MAX_MS: int = 30_000
-
-    # --- Agentic loop ---
-    AGENT_MAX_REQUESTS_PER_SYMBOL: int = 6
-    AGENT_VERIFY_MIN_CONFIDENCE: float = 0.60
-
-    # --- API schema versioning ---
-    API_SCHEMA_VERSION: str = "1"
+    @field_validator("API_ROOT_PATH", mode="before")
+    @classmethod
+    def _root_path_strip(cls, v: object) -> str:
+        s = "" if v is None else str(v).strip()
+        if not s:
+            return ""
+        # normalize: ensure leading slash, no trailing slash
+        if not s.startswith("/"):
+            s = "/" + s
+        return s.rstrip("/")
 
     @field_validator("IFIND_HTTP_BASE_URL", mode="before")
     @classmethod
     def _coerce_base_url(cls, v: object) -> str:
-        # Important: env can override defaults with an empty string; treat it as "unset".
         if v is None:
             return "https://quantapi.51ifind.com"
         s = str(v).strip()

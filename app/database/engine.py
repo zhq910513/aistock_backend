@@ -1,38 +1,61 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 from app.config import settings
 
-_engine = None
-SessionLocal = None
+_engine: Optional[Engine] = None
+
+# IMPORTANT:
+# - SessionLocal must be callable at import time.
+# - We configure its bind lazily in init_engine().
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, future=True)
 
 
 def init_engine() -> None:
-    global _engine, SessionLocal
+    """Initialize the global SQLAlchemy Engine + bind SessionLocal.
+
+    Safe to call multiple times.
+    """
+    global _engine
+
     if _engine is not None:
         return
 
+    url = str(settings.DATABASE_URL).strip()
+
+    connect_args = {}
+    # SQLite needs special handling for threads.
+    if url.startswith("sqlite:"):
+        connect_args["check_same_thread"] = False
+
     _engine = create_engine(
-        settings.DATABASE_URL,
-        pool_pre_ping=True,
+        url,
         future=True,
+        pool_pre_ping=True,
+        connect_args=connect_args,
     )
-    SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
+
+    # Bind the already-imported SessionLocal factory (fixes 'NoneType is not callable').
+    SessionLocal.configure(bind=_engine)
 
 
-def get_engine():
+def get_engine() -> Engine:
     if _engine is None:
         init_engine()
+    assert _engine is not None
     return _engine
 
 
 def init_schema_check() -> None:
-    """
-    Since we are redesigning without alembic migrations, we treat schema as fresh:
+    """Connectivity + schema bootstrap.
+
+    We treat schema as fresh:
     - verify connectivity
-    - ensure timezone behavior
     - create tables if missing (create_all is safe on empty DB)
     """
     eng = get_engine()
@@ -41,4 +64,5 @@ def init_schema_check() -> None:
         conn.commit()
 
     from app.database.models import Base
+
     Base.metadata.create_all(bind=eng)

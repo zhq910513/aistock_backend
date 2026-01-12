@@ -1,13 +1,26 @@
 import asyncio
+
 from fastapi import FastAPI
 
 from app.api.router import router
+from app.config import settings
 from app.core.orchestrator import Orchestrator
-from app.database.engine import init_engine, init_schema_check
+from app.database.engine import init_engine, init_schema_check, SessionLocal
+from app.database.repo import Repo
 from app.utils.time import now_shanghai_str
 
 
-app = FastAPI(title="AIStock_backend (QEE-S³/S³.1)", version="2.0.0")
+app = FastAPI(
+    title="AIStock_backend (QEE-S³/S³.1)",
+    version="2.0.0",
+    # Reverse-proxy aware Swagger/OpenAPI paths:
+    root_path=settings.API_ROOT_PATH,
+    docs_url="/docs",
+    redoc_url=None,
+    openapi_url="/openapi.json",
+    swagger_ui_oauth2_redirect_url="/docs/oauth2-redirect",
+)
+
 app.include_router(router)
 
 _orchestrator: Orchestrator | None = None
@@ -16,25 +29,25 @@ _orchestrator_task: asyncio.Task | None = None
 
 @app.on_event("startup")
 async def _startup() -> None:
+    global _orchestrator, _orchestrator_task
+
     init_engine()
     init_schema_check()
 
-    global _orchestrator, _orchestrator_task
-    _orchestrator = Orchestrator()
-    _orchestrator_task = asyncio.create_task(_orchestrator.run(), name="orchestrator.run")
-
-    # Startup audit
-    from app.database.repo import Repo
-    from app.database.engine import SessionLocal
-
+    # Ensure SystemStatus row exists (keeps /status deterministic and avoids first-hit races).
     with SessionLocal() as s:
-        Repo(s).system_events.write_event(
-            event_type="SYSTEM_STARTUP",
-            correlation_id=None,
-            severity="INFO",
-            payload={"time": now_shanghai_str(), "message": "Backend started"},
-        )
+        Repo(s).system_status.get_for_update()
         s.commit()
+
+    # Orchestrator is optional; default off for API-only deployments/tests.
+    if settings.START_ORCHESTRATOR:
+        try:
+            _orchestrator = Orchestrator()
+            _orchestrator_task = asyncio.create_task(_orchestrator.run())
+        except Exception:
+            # Keep API up even if orchestrator init fails.
+            _orchestrator = None
+            _orchestrator_task = None
 
 
 @app.on_event("shutdown")
