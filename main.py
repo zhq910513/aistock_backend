@@ -7,13 +7,11 @@ from app.config import settings
 from app.core.orchestrator import Orchestrator
 from app.database.engine import init_engine, init_schema_check, SessionLocal
 from app.database.repo import Repo
-from app.utils.time import now_shanghai_str
 
 
 app = FastAPI(
     title="AIStock_backend (QEE-S³/S³.1)",
     version="2.0.0",
-    # Reverse-proxy aware Swagger/OpenAPI paths:
     root_path=settings.API_ROOT_PATH,
     docs_url="/docs",
     redoc_url=None,
@@ -34,18 +32,16 @@ async def _startup() -> None:
     init_engine()
     init_schema_check()
 
-    # Ensure SystemStatus row exists (keeps /status deterministic and avoids first-hit races).
+    # Ensure SystemStatus row exists to make /status deterministic
     with SessionLocal() as s:
         Repo(s).system_status.get_for_update()
         s.commit()
 
-    # Orchestrator is optional; default off for API-only deployments/tests.
     if settings.START_ORCHESTRATOR:
         try:
             _orchestrator = Orchestrator()
             _orchestrator_task = asyncio.create_task(_orchestrator.run())
         except Exception:
-            # Keep API up even if orchestrator init fails.
             _orchestrator = None
             _orchestrator_task = None
 
@@ -62,5 +58,4 @@ async def _shutdown() -> None:
         try:
             await _orchestrator_task
         except Exception:
-            # ignore cancel/teardown errors
             pass
