@@ -81,6 +81,7 @@ class IFindTokenManager:
     - get_access_token: returns current valid access_token
     - update_access_token: returns a new access_token (invalidates all old ones)
     """
+
     def __init__(self, base_url: str, refresh_token: str, initial_access_token: str = "", timeout_sec: float = 8.0) -> None:
         self._base_url = (base_url or "https://quantapi.51ifind.com").rstrip("/")
         self._refresh_token = (refresh_token or "").strip()
@@ -140,7 +141,7 @@ class IFindTokenManager:
 
             return None
 
-def force_update_access_token(self) -> str | None:
+    def force_update_access_token(self) -> str | None:
         return self.get_access_token(force_refresh=True)
 
 
@@ -171,6 +172,7 @@ class IFindHTTPProvider:
     - access_token is passed via HTTP header:
       {"Content-Type":"application/json","access_token": user_access_token}
     """
+
     def __init__(self, base_url: Optional[str] = None, token: Optional[str] = None, timeout_sec: float = 8.0) -> None:
         self._base_url = (base_url or settings.IFIND_HTTP_BASE_URL).rstrip("/")
         # token here is optional; if omitted we will resolve via token manager.

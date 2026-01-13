@@ -12,6 +12,7 @@ from app.database import models
 from app.utils.time import now_shanghai_str, now_shanghai, to_shanghai, trading_day_str
 from app.utils.crypto import sha256_hex
 from app.config import settings
+from app.core.labeling_planner import build_plan
 
 
 router = APIRouter()
@@ -289,7 +290,36 @@ def upsert_ui_signal_inputs(payload: dict = Body(...)) -> dict:
     with SessionLocal() as s:
         repo = Repo(s)
         res = repo.labeling_candidates.upsert_batch(trading_day=td, target_day=target_td, items=items, source="UI")
+
+        # Update watchlist (symbols may appear repeatedly across days).
+        # When LABELING_AUTO_FETCH_ENABLED is on, enqueue a model-driven (planner) data fetch plan.
+        planned = 0
+        for it in items:
+            symbol = str((it or {}).get("symbol") or "").strip()
+            if not symbol:
+                continue
+            wl = repo.watchlist.upsert_hit(symbol=symbol, trading_day=td)
+            if settings.LABELING_AUTO_FETCH_ENABLED and wl.active:
+                plan = build_plan(symbol=symbol, hit_count=int(wl.hit_count), planner_state=dict(wl.planner_state or {}))
+                # Persist planner state back
+                wl.planner_state = plan.planner_state
+                for pr in plan.requests:
+                    repo.data_requests.enqueue(
+                        dedupe_key=pr.dedupe_key,
+                        correlation_id=pr.correlation_id,
+                        account_id=None,
+                        symbol=symbol,
+                        purpose=pr.purpose,
+                        provider=settings.DATA_PROVIDER,
+                        endpoint=pr.endpoint,
+                        params_canonical=pr.params_canonical,
+                        request_payload=pr.payload,
+                        deadline_sec=pr.deadline_sec,
+                    )
+                    planned += 1
+
         s.commit()
+        res["planned_requests"] = planned
 
     return {
         "trading_day": datetime.strptime(td, "%Y%m%d").strftime("%Y-%m-%d"),
@@ -340,6 +370,87 @@ def ui_controls_patch(payload: dict) -> dict:
         updated = repo.controls.patch(payload or {})
         s.commit()
         return updated
+
+
+
+@router.get("/ui/watchlist")
+def ui_watchlist(limit: int = 200) -> list[dict]:
+    with SessionLocal() as s:
+        repo = Repo(s)
+        rows = repo.watchlist.list(limit=limit)
+        s.commit()
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "symbol": r.symbol,
+                    "first_seen_day": r.first_seen_day,
+                    "last_seen_day": r.last_seen_day,
+                    "hit_count": int(r.hit_count or 0),
+                    "active": bool(r.active),
+                    "next_refresh_at": r.next_refresh_at.isoformat() if r.next_refresh_at else None,
+                    "planner_state": r.planner_state,
+                    "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                }
+            )
+        return out
+
+
+@router.patch("/ui/watchlist/{symbol}")
+def ui_watchlist_patch(symbol: str, payload: dict = Body(...)) -> dict:
+    active = payload.get("active")
+    if active is None:
+        raise HTTPException(status_code=400, detail="active is required")
+    with SessionLocal() as s:
+        repo = Repo(s)
+        row = repo.watchlist.set_active(symbol, bool(active))
+        s.commit()
+        return {
+            "symbol": row.symbol,
+            "active": bool(row.active),
+            "hit_count": int(row.hit_count or 0),
+            "next_refresh_at": row.next_refresh_at.isoformat() if row.next_refresh_at else None,
+        }
+
+
+@router.get("/ui/symbol/{symbol}/snapshots")
+def ui_symbol_snapshots(symbol: str, limit: int = 50) -> list[dict]:
+    symbol = (symbol or "").strip()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol required")
+    with SessionLocal() as s:
+        repo = Repo(s)
+        rows = repo.feature_snapshots.list_by_symbol(symbol, limit=limit)
+        s.commit()
+        return [
+            {
+                "snapshot_id": r.snapshot_id,
+                "symbol": r.symbol,
+                "feature_set": r.feature_set,
+                "asof_ts": r.asof_ts.isoformat(),
+                "planner_version": r.planner_version,
+                "request_ids": r.request_ids,
+                "features": r.features,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+@router.get("/ui/labeling_settings")
+def ui_labeling_settings() -> dict:
+    # read-only view of pipeline knobs (controlled via env)
+    return {
+        "auto_fetch_enabled": bool(settings.LABELING_AUTO_FETCH_ENABLED),
+        "poll_ms": int(settings.LABELING_PIPELINE_POLL_MS),
+        "refresh_base_sec": int(settings.LABELING_REFRESH_BASE_SEC),
+        "refresh_active_sec": int(settings.LABELING_REFRESH_ACTIVE_SEC),
+        "history_days_base": int(settings.LABELING_HISTORY_DAYS_BASE),
+        "history_days_expand": int(settings.LABELING_HISTORY_DAYS_EXPAND),
+        "history_days_max": int(settings.LABELING_HISTORY_DAYS_MAX),
+        "hf_limit_base": int(settings.LABELING_HF_LIMIT_BASE),
+        "max_symbols_per_cycle": int(settings.LABELING_MAX_SYMBOLS_PER_CYCLE),
+    }
 
 
 @router.get("/accounts")

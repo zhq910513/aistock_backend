@@ -266,6 +266,64 @@ class LabelingCandidate(Base):
     )
 
 
+class SymbolWatchlist(Base):
+    """Long-lived watchlist for symbols that repeatedly hit the labeling candidate criteria.
+
+    This drives continuous data refresh + dimensional expansion to accumulate '涨停基因' evidence.
+    """
+
+    __tablename__ = "symbol_watchlist"
+
+    symbol = Column(String(32), primary_key=True)
+
+    # YYYYMMDD (Beijing)
+    first_seen_day = Column(String(8), nullable=False, index=True)
+    last_seen_day = Column(String(8), nullable=False, index=True)
+
+    hit_count = Column(Integer, nullable=False, default=0)
+    active = Column(Boolean, nullable=False, default=True)
+
+    # Planner state: stage, last_plan_at, last_snapshot_at, etc.
+    planner_state = Column(JSON, nullable=False, default=dict)
+
+    next_refresh_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("ix_watchlist_active_refresh", "active", "next_refresh_at"),
+    )
+
+
+class SymbolFeatureSnapshot(Base):
+    """Versioned feature snapshots for a symbol, derived from fetched data responses.
+
+    Stored as a time-series for later learning / analysis.
+    """
+
+    __tablename__ = "symbol_feature_snapshots"
+
+    snapshot_id = Column(String(64), primary_key=True)
+
+    symbol = Column(String(32), nullable=False, index=True)
+    feature_set = Column(String(64), nullable=False, default="AUTO")  # AUTO/BASE/EXPAND/...
+    asof_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    # Linkage
+    request_ids = Column(JSON, nullable=False, default=list)  # list[str]
+    planner_version = Column(String(32), nullable=False, default="planner_v1")
+
+    features = Column(JSON, nullable=False, default=dict)
+
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("ix_feature_snapshots_symbol_asof", "symbol", "asof_ts"),
+    )
+
+
+
 
 class DecisionBundle(Base):
     __tablename__ = "decision_bundles"

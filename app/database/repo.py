@@ -656,6 +656,159 @@ class LabelingCandidatesRepo:
 
 
 
+
+@dataclass
+class WatchlistRepo:
+    s: Session
+
+    def upsert_hit(self, *, symbol: str, trading_day: str) -> models.SymbolWatchlist:
+        now = now_shanghai()
+        row = self.s.get(models.SymbolWatchlist, symbol)
+        if row is None:
+            row = models.SymbolWatchlist(
+                symbol=symbol,
+                first_seen_day=trading_day,
+                last_seen_day=trading_day,
+                hit_count=1,
+                active=True,
+                planner_state={},
+                next_refresh_at=now,  # schedule immediately
+                created_at=now,
+                updated_at=now,
+            )
+            self.s.add(row)
+            self.s.flush()
+            return row
+
+        row.last_seen_day = trading_day
+        row.hit_count = int(row.hit_count or 0) + 1
+        row.updated_at = now
+        # schedule sooner if active
+        if row.active:
+            row.next_refresh_at = min(row.next_refresh_at or now, now)
+        return row
+
+    def set_active(self, symbol: str, active: bool) -> models.SymbolWatchlist:
+        now = now_shanghai()
+        row = self.s.get(models.SymbolWatchlist, symbol)
+        if row is None:
+            # Create a minimal record if missing
+            td = trading_day_str(now)
+            row = models.SymbolWatchlist(
+                symbol=symbol,
+                first_seen_day=td,
+                last_seen_day=td,
+                hit_count=0,
+                active=bool(active),
+                planner_state={},
+                next_refresh_at=(now if active else None),
+                created_at=now,
+                updated_at=now,
+            )
+            self.s.add(row)
+            self.s.flush()
+            return row
+
+        row.active = bool(active)
+        row.updated_at = now
+        row.next_refresh_at = (now if row.active else None)
+        return row
+
+    def list(self, limit: int = 200) -> list[models.SymbolWatchlist]:
+        return (
+            self.s.execute(
+                select(models.SymbolWatchlist).order_by(models.SymbolWatchlist.updated_at.desc()).limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+
+    def due_for_refresh(self, limit: int = 50) -> list[models.SymbolWatchlist]:
+        now = now_shanghai()
+        return (
+            self.s.execute(
+                select(models.SymbolWatchlist)
+                .where(models.SymbolWatchlist.active == True)  # noqa: E712
+                .where(models.SymbolWatchlist.next_refresh_at.is_not(None))
+                .where(models.SymbolWatchlist.next_refresh_at <= now)
+                .order_by(models.SymbolWatchlist.next_refresh_at.asc())
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+            .scalars()
+            .all()
+        )
+
+    def set_next_refresh_in(self, symbol: str, seconds: int) -> None:
+        now = now_shanghai()
+        row = self.s.get(models.SymbolWatchlist, symbol)
+        if row is None:
+            return
+        if not row.active:
+            row.next_refresh_at = None
+        else:
+            row.next_refresh_at = now + timedelta(seconds=int(seconds))
+        row.updated_at = now
+
+
+@dataclass
+class FeatureSnapshotsRepo:
+    s: Session
+
+    def write(
+        self,
+        *,
+        symbol: str,
+        feature_set: str,
+        asof_ts,
+        features: dict,
+        request_ids: list[str],
+        planner_version: str = "planner_v1",
+    ) -> str:
+        # Snapshot id is deterministic to avoid duplicates on retries.
+        material = f"{symbol}|{feature_set}|{asof_ts.isoformat()}|{sha256_hex(str(features).encode('utf-8'))}"
+        sid = sha256_hex(material.encode("utf-8"))[:64]
+        row = self.s.get(models.SymbolFeatureSnapshot, sid)
+        if row is not None:
+            return sid
+
+        self.s.add(
+            models.SymbolFeatureSnapshot(
+                snapshot_id=sid,
+                symbol=symbol,
+                feature_set=str(feature_set or "AUTO"),
+                asof_ts=asof_ts,
+                request_ids=list(request_ids or []),
+                planner_version=str(planner_version or "planner_v1"),
+                features=features or {},
+                created_at=now_shanghai(),
+            )
+        )
+        return sid
+
+    def list_by_symbol(self, symbol: str, limit: int = 50) -> list[models.SymbolFeatureSnapshot]:
+        return (
+            self.s.execute(
+                select(models.SymbolFeatureSnapshot)
+                .where(models.SymbolFeatureSnapshot.symbol == symbol)
+                .order_by(models.SymbolFeatureSnapshot.asof_ts.desc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+
+    def latest_by_symbol(self, symbol: str) -> models.SymbolFeatureSnapshot | None:
+        return (
+            self.s.execute(
+                select(models.SymbolFeatureSnapshot)
+                .where(models.SymbolFeatureSnapshot.symbol == symbol)
+                .order_by(models.SymbolFeatureSnapshot.asof_ts.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
 @dataclass
 class Repo:
     s: Session
@@ -680,6 +833,14 @@ class Repo:
     @property
     def labeling_candidates(self) -> LabelingCandidatesRepo:
         return LabelingCandidatesRepo(self.s)
+
+    @property
+    def watchlist(self) -> WatchlistRepo:
+        return WatchlistRepo(self.s)
+
+    @property
+    def feature_snapshots(self) -> FeatureSnapshotsRepo:
+        return FeatureSnapshotsRepo(self.s)
 
     @property
     def nonce(self) -> NonceRepo:

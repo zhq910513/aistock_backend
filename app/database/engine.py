@@ -10,19 +10,26 @@ from app.config import settings
 
 _engine: Optional[Engine] = None
 
-# MUST be callable at import time
+# IMPORTANT:
+# - SessionLocal must be callable at import time.
+# - We configure its bind lazily in init_engine().
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, future=True)
 
 
 def init_engine() -> None:
-    """Initialize global engine and bind SessionLocal (safe to call multiple times)."""
+    """Initialize the global SQLAlchemy Engine + bind SessionLocal.
+
+    Safe to call multiple times.
+    """
     global _engine
+
     if _engine is not None:
         return
 
     url = str(settings.DATABASE_URL).strip()
-    connect_args = {}
 
+    connect_args = {}
+    # SQLite needs special handling for threads.
     if url.startswith("sqlite:"):
         connect_args["check_same_thread"] = False
 
@@ -33,6 +40,7 @@ def init_engine() -> None:
         connect_args=connect_args,
     )
 
+    # Bind the already-imported SessionLocal factory (fixes 'NoneType is not callable').
     SessionLocal.configure(bind=_engine)
 
 
@@ -44,7 +52,12 @@ def get_engine() -> Engine:
 
 
 def init_schema_check() -> None:
-    """Connectivity check + create tables if missing."""
+    """Connectivity + schema bootstrap.
+
+    We treat schema as fresh:
+    - verify connectivity
+    - create tables if missing (create_all is safe on empty DB)
+    """
     eng = get_engine()
     with eng.connect() as conn:
         conn.execute(text("SELECT 1"))
