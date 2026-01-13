@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
+import hashlib
 
 from app.config import settings
 from app.utils.time import now_shanghai
@@ -16,6 +17,7 @@ class PlannedRequest:
     purpose: str
     priority: int
     dedupe_key: str
+    correlation_id: str
 
 
 @dataclass
@@ -42,6 +44,11 @@ def _dedupe_key(symbol: str, endpoint: str, params: dict) -> str:
     return f"{symbol}|{endpoint}|{joined}"
 
 
+def _mk_correlation_id(trading_day: str, stage: int, dedupe_key: str) -> str:
+    h = hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()[:10]
+    return f"LP:{trading_day}:{stage}:{h}"
+
+
 def build_plan(
     symbol: str,
     trading_day: str | None = None,
@@ -54,8 +61,8 @@ def build_plan(
       - router:   build_plan(symbol=..., hit_count=..., planner_state={...})
       - pipeline: build_plan(symbol=..., trading_day=..., hit_count=...)
 
-    返回 Plan 时一定带 planner_state，用于 watchlist 持久化，避免 500。
-    v1 里先写入一些基础元信息，为后续“持续扩维/持续更新/基因画像”做铺垫。
+    返回 Plan 时一定带 planner_state；PlannedRequest 带 correlation_id，
+    与 router 的 enqueue 入参对齐，避免 500。
     """
     symbol = (symbol or "").strip()
     now = now_shanghai()
@@ -78,7 +85,7 @@ def build_plan(
     hf_limit = int(getattr(settings, "LABELING_HF_LIMIT_BASE", 240))
     hf_limit = max(60, min(2000, hf_limit + stage * 120))
 
-    # iFinD HTTP: params里既放 ths_code，也放 symbol，便于你们 adapter / mock
+    # iFinD HTTP: params里既放 ths_code，也放 symbol
     rt_payload = {"symbol": symbol, "ths_code": symbol}
 
     end_dt = now
@@ -102,6 +109,7 @@ def build_plan(
     reqs: list[PlannedRequest] = []
 
     # 1) real-time quote
+    dk1 = _dedupe_key(symbol, "IFIND_HTTP.real_time_quotation", rt_payload)
     reqs.append(
         PlannedRequest(
             symbol=symbol,
@@ -109,11 +117,13 @@ def build_plan(
             params=rt_payload,
             purpose="LABELING_BASE",
             priority=100,
-            dedupe_key=_dedupe_key(symbol, "IFIND_HTTP.real_time_quotation", rt_payload),
+            dedupe_key=dk1,
+            correlation_id=_mk_correlation_id(td, stage, dk1),
         )
     )
 
     # 2) daily history
+    dk2 = _dedupe_key(symbol, "IFIND_HTTP.cmd_history_quotation", hist_payload)
     reqs.append(
         PlannedRequest(
             symbol=symbol,
@@ -121,11 +131,13 @@ def build_plan(
             params=hist_payload,
             purpose="LABELING_BASE" if stage == 0 else "LABELING_EXPAND",
             priority=80,
-            dedupe_key=_dedupe_key(symbol, "IFIND_HTTP.cmd_history_quotation", hist_payload),
+            dedupe_key=dk2,
+            correlation_id=_mk_correlation_id(td, stage, dk2),
         )
     )
 
     # 3) high frequency
+    dk3 = _dedupe_key(symbol, "IFIND_HTTP.high_frequency", hf_payload)
     reqs.append(
         PlannedRequest(
             symbol=symbol,
@@ -133,13 +145,13 @@ def build_plan(
             params=hf_payload,
             purpose="LABELING_BASE" if stage == 0 else "LABELING_REFRESH",
             priority=60,
-            dedupe_key=_dedupe_key(symbol, "IFIND_HTTP.high_frequency", hf_payload),
+            dedupe_key=dk3,
+            correlation_id=_mk_correlation_id(td, stage, dk3),
         )
     )
 
-    # ---- planner_state：持久化到 watchlist，用于后续持续扩维/持续更新 ----
+    # ---- planner_state：持久化到 watchlist ----
     st: dict[str, Any] = dict(planner_state or {})
-    # 记录本次规划元信息（后续你要做“涨停基因画像”时很有用）
     st["stage"] = stage
     st["last_planned_day"] = td
     st["history_days"] = history_days
@@ -161,6 +173,5 @@ def calc_refresh_seconds(hit_count: int) -> int:
     return max(60, base)
 
 
-# 向后兼容别名：避免任何地方写旧名导致启动/接口崩溃
 def calc_refresh_sec(hit_count: int) -> int:
     return calc_refresh_seconds(hit_count)
