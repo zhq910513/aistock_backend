@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import models
-from app.utils.time import now_shanghai, trading_day_str
+from app.utils.time import now_shanghai, trading_day_str, to_shanghai
 from app.utils.crypto import sha256_hex
 
 
@@ -685,7 +685,14 @@ class WatchlistRepo:
         row.updated_at = now
         # schedule sooner if active
         if row.active:
-            row.next_refresh_at = min(row.next_refresh_at or now, now)
+            cur = row.next_refresh_at
+            if cur is not None:
+                try:
+                    cur = to_shanghai(cur)
+                except Exception:
+                    # fallback: schedule immediately
+                    cur = now
+            row.next_refresh_at = min(cur or now, now)
         return row
 
     def set_active(self, symbol: str, active: bool) -> models.SymbolWatchlist:
