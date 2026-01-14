@@ -10,7 +10,8 @@ from app.core.data_dispatcher import DataRequestDispatcher
 from app.core.labeling_planner import build_plan
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
-from app.utils.time import now_shanghai_str
+from app.utils.symbols import normalize_symbol
+from app.utils.time import now_shanghai, now_shanghai_str
 
 
 _LOG_PATH = "/tmp/labeling_pipeline.log"
@@ -109,29 +110,50 @@ class LabelingPipeline:
                 for row in due:
                     if not row.active:
                         continue
+
+                    # Canonicalize symbol early; never let invalid/empty symbol spawn requests.
+                    raw_sym = str(row.symbol or "").strip()
+                    sym = normalize_symbol(raw_sym)
+                    if not sym:
+                        # should never happen, but if it does: disable this row to stop endless retries
+                        row.active = False
+                        row.next_refresh_at = None
+                        row.updated_at = now_shanghai()
+                        self._log.warning("watchlist_row_invalid_symbol_disabled: raw=%r", raw_sym)
+                        continue
+
                     plan = build_plan(
-                        symbol=row.symbol,
+                        symbol=sym,
                         hit_count=int(row.hit_count or 0),
                         planner_state=dict(row.planner_state or {}),
                     )
-                    # persist planner state
+
+                    # persist planner state (planner decides next stages)
+                    row.symbol = sym
                     row.planner_state = plan.planner_state
 
                     for pr in plan.requests:
+                        # PlannedRequest is frozen; do not mutate.
+                        # build_plan() already guarantees pr.symbol is present and payload includes symbol/thscode.
                         _rid, created = repo.data_requests.enqueue_planned(pr, provider=settings.DATA_PROVIDER)
                         if created:
                             enq += 1
 
                     # refresh policy
                     next_sec = int(plan.planner_state.get("next_refresh_in_sec") or settings.LABELING_REFRESH_ACTIVE_SEC)
-                    repo.watchlist.set_next_refresh_in(row.symbol, next_sec)
+                    repo.watchlist.set_next_refresh_in(sym, next_sec)
+
             except Exception as e:
                 # do not block dispatcher on planner failures
                 self._log.warning("planner_failed: %r", e)
 
             # 2) dispatcher: execute pending requests
             res = self._dispatcher.pump_once(s, limit=200)
-            processed = int(getattr(res, "sent", 0) or 0) + int(getattr(res, "received", 0) or 0) + int(getattr(res, "failed", 0) or 0)
+            processed = (
+                int(getattr(res, "sent", 0) or 0)
+                + int(getattr(res, "received", 0) or 0)
+                + int(getattr(res, "failed", 0) or 0)
+            )
 
             s.commit()
 

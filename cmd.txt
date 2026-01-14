@@ -1,3 +1,6 @@
+tree /A /F > tree.txt
+
+
 cd /data/backend/aistock_backend/
 git pull
 

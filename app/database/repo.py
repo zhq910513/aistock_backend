@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 from datetime import timedelta
+import json
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -11,6 +12,7 @@ from app.config import settings
 from app.database import models
 from app.utils.time import now_shanghai, trading_day_str, to_shanghai
 from app.utils.crypto import sha256_hex
+from app.utils.symbols import normalize_symbol
 
 
 @dataclass
@@ -430,6 +432,73 @@ class StrategyContractsRepo:
 class DataRequestsRepo:
     s: Session
 
+    def _norm_symbol(self, symbol: str | None) -> str | None:
+        # Canonicalize and ensure non-empty.
+        sym = normalize_symbol(symbol)
+        return sym if sym else None
+
+    def _try_parse_json_obj(self, v: Any) -> Any:
+        if isinstance(v, (dict, list)):
+            return v
+        if not isinstance(v, str):
+            return None
+        s = v.strip()
+        if not s:
+            return None
+        if not (s.startswith("{") or s.startswith("[")):
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+
+    def _extract_symbol_from_obj(self, obj: Any) -> str | None:
+        if not isinstance(obj, dict):
+            return None
+
+        # direct keys (provider/raw conventions)
+        for k in ("symbol", "thscode", "ths_code", "ts_code", "code", "ticker"):
+            if k in obj:
+                v = self._norm_symbol(str(obj.get(k) or ""))
+                if v:
+                    return v
+
+        # planner v1: payload uses "codes": "<sym>"
+        if "codes" in obj:
+            v = self._norm_symbol(str(obj.get("codes") or ""))
+            if v:
+                return v
+
+        # common nested patterns
+        for nest_key in ("params", "data", "request", "payload", "result"):
+            nest = obj.get(nest_key)
+            v = self._extract_symbol_from_obj(nest)
+            if v:
+                return v
+
+        return None
+
+    def _extract_symbol_from_planned(self, pr: Any) -> str | None:
+        # 1) direct field
+        v = self._norm_symbol(getattr(pr, "symbol", None))
+        if v:
+            return v
+
+        # 2) payload dict (most reliable for provider calls)
+        payload = getattr(pr, "payload", None)
+        v = self._extract_symbol_from_obj(payload)
+        if v:
+            return v
+
+        # 3) params_canonical may be dict/json string (some planners embed json)
+        pc = getattr(pr, "params_canonical", None)
+        pc_obj = self._try_parse_json_obj(pc)
+        v = self._extract_symbol_from_obj(pc_obj)
+        if v:
+            return v
+
+        return None
+
     def enqueue(
         self,
         *,
@@ -450,13 +519,14 @@ class DataRequestsRepo:
 
         now = now_shanghai()
         rid = sha256_hex(f"{dedupe_key}|{now.isoformat()}".encode("utf-8"))[:32]
+
         self.s.add(
             models.DataRequest(
                 request_id=rid,
                 dedupe_key=dedupe_key,
                 correlation_id=correlation_id,
                 account_id=account_id,
-                symbol=symbol,
+                symbol=self._norm_symbol(symbol),
                 purpose=purpose,
                 provider=provider,
                 endpoint=endpoint,
@@ -477,17 +547,53 @@ class DataRequestsRepo:
         """
         Compatibility helper: accept PlannedRequest (labeling_planner.PlannedRequest) and enqueue once.
         Returns (request_id, created_bool).
+
+        IMPORTANT:
+        - Do NOT allow symbol="" to silently enter DB.
+        - Try extracting symbol from multiple planned-request fields.
+        - If still missing, write a FAILED DataRequest (non-PENDING) to avoid polluting pipeline.
         """
         dedupe_key = str(getattr(pr, "dedupe_key"))
         existing = self.s.execute(select(models.DataRequest).where(models.DataRequest.dedupe_key == dedupe_key)).scalar_one_or_none()
         if existing is not None:
             return str(existing.request_id), False
 
+        symbol = self._extract_symbol_from_planned(pr)
+
+        # If still missing, record a FAILED request (observable), but do not enqueue into PENDING pipeline.
+        if not symbol:
+            now = now_shanghai()
+            rid = sha256_hex(f"{dedupe_key}|{now.isoformat()}".encode("utf-8"))[:32]
+            self.s.add(
+                models.DataRequest(
+                    request_id=rid,
+                    dedupe_key=dedupe_key,
+                    correlation_id=getattr(pr, "correlation_id", None),
+                    account_id=None,
+                    symbol=None,
+                    purpose=str(getattr(pr, "purpose", "")),
+                    provider=provider,
+                    endpoint=str(getattr(pr, "endpoint")),
+                    params_canonical=str(getattr(pr, "params_canonical", "")),
+                    request_payload=getattr(pr, "payload", {}) or {},
+                    status="FAILED",
+                    attempts=0,
+                    last_error="symbol_missing_in_planned_request",
+                    created_at=now,
+                    sent_at=None,
+                    deadline_at=(now + timedelta(seconds=int(getattr(pr, "deadline_sec", 0) or 0)))
+                    if int(getattr(pr, "deadline_sec", 0) or 0)
+                    else None,
+                    response_id=None,
+                )
+            )
+            return rid, True
+
         rid = self.enqueue(
             dedupe_key=dedupe_key,
             correlation_id=getattr(pr, "correlation_id", None),
             account_id=None,
-            symbol=getattr(pr, "symbol", None),
+            symbol=symbol,
             purpose=str(getattr(pr, "purpose", "")),
             provider=provider,
             endpoint=str(getattr(pr, "endpoint")),
@@ -511,9 +617,40 @@ class DataRequestsRepo:
         )
 
     def mark_sent(self, req: models.DataRequest) -> None:
+        """
+        IMPORTANT FIX:
+        deadline_at was previously computed at enqueue-time (created_at + deadline_sec).
+        If the queue/poll delays dispatch, deadline_at can end up < sent_at, which is nonsense.
+        We preserve the intended TTL (deadline_at - created_at) and rebase it at sent_at when needed.
+        """
+        now = now_shanghai()
         req.status = "SENT"
-        req.sent_at = now_shanghai()
+        req.sent_at = now
         req.attempts = int(req.attempts) + 1
+
+        if req.deadline_at is None:
+            return
+
+        try:
+            dl = to_shanghai(req.deadline_at)
+        except Exception:
+            dl = None
+
+        if dl is None:
+            return
+
+        if dl <= now:
+            # Rebase TTL (best-effort). If created_at missing/bad, fallback to 1 second.
+            ttl_sec = 1
+            try:
+                ca = to_shanghai(req.created_at) if req.created_at is not None else None
+                if ca is not None:
+                    ttl = (dl - ca).total_seconds()
+                    ttl_sec = max(1, int(round(ttl)))
+            except Exception:
+                ttl_sec = 1
+
+            req.deadline_at = now + timedelta(seconds=ttl_sec)
 
     def mark_failed(self, req: models.DataRequest, err: str) -> None:
         req.status = "FAILED"
@@ -612,7 +749,7 @@ class LabelingCandidatesRepo:
         updated = 0
 
         for it in items:
-            symbol = str(it.get("symbol") or "").strip()
+            symbol = normalize_symbol(str(it.get("symbol") or "").strip())
             if not symbol:
                 continue
 
@@ -679,6 +816,8 @@ class WatchlistRepo:
 
     def upsert_hit(self, *, symbol: str, trading_day: str) -> models.SymbolWatchlist:
         now = now_shanghai()
+        symbol = normalize_symbol(symbol)
+
         row = self.s.get(models.SymbolWatchlist, symbol)
         if row is None:
             row = models.SymbolWatchlist(
@@ -720,6 +859,10 @@ class WatchlistRepo:
 
     def set_active(self, symbol: str, active: bool) -> models.SymbolWatchlist:
         now = now_shanghai()
+        symbol = normalize_symbol(symbol)
+        if not symbol:
+            raise ValueError("invalid_symbol")
+
         row = self.s.get(models.SymbolWatchlist, symbol)
         if row is None:
             td = trading_day_str(now)
@@ -778,6 +921,7 @@ class WatchlistRepo:
 
     def set_next_refresh_in(self, symbol: str, seconds: int) -> None:
         now = now_shanghai()
+        symbol = normalize_symbol(symbol)
         row = self.s.get(models.SymbolWatchlist, symbol)
         if row is None:
             return

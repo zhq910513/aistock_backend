@@ -4,14 +4,18 @@ from dataclasses import dataclass
 from typing import Any
 import math
 import json
+from datetime import datetime
 
 from app.utils.crypto import sha256_hex
+from app.utils.symbols import normalize_symbol
 
 
 @dataclass
 class FeatureExtractionResult:
     features: dict[str, Any]
     feature_hash: str
+    # Optional: timestamp used for snapshot as-of time (Asia/Shanghai).
+    asof_ts: datetime | None = None
 
 
 def _to_float(x: Any) -> float | None:
@@ -72,6 +76,7 @@ def _ifind_table_dict(raw: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(tab, dict):
         return tab
     return None
+
 
 def _first_non_none(nums: list[float | None]) -> float | None:
     for n in nums:
@@ -179,7 +184,11 @@ class FeatureExtractor:
         realtime_raw: dict[str, Any] | None,
         history_raw: dict[str, Any] | None,
         intraday_raw: dict[str, Any] | None = None,
+        *,
+        asof_ts: datetime | None = None,
     ) -> FeatureExtractionResult:
+        sym = normalize_symbol(symbol)
+
         price_now = _extract_price_from_realtime(realtime_raw or {}) if realtime_raw else None
         series = _extract_close_series_from_history(history_raw or {}) if history_raw else []
 
@@ -217,7 +226,7 @@ class FeatureExtractor:
         intraday_ret, intraday_vol_sum, intraday_points = _extract_intraday_metrics(intraday_raw)
 
         features = {
-            "symbol": symbol,
+            "symbol": sym,
             "price_now": float(price_now) if price_now is not None else 0.0,
             "ret_1d": float(ret_1d),
             "momentum_3d": float(momentum_3d),
@@ -229,4 +238,41 @@ class FeatureExtractor:
         }
 
         feature_hash = sha256_hex(json.dumps(features, sort_keys=True, ensure_ascii=False).encode("utf-8"))
-        return FeatureExtractionResult(features=features, feature_hash=feature_hash)
+        # IMPORTANT: do not fabricate asof_ts here; upstream decides deterministically.
+        return FeatureExtractionResult(features=features, feature_hash=feature_hash, asof_ts=asof_ts)
+
+    def extract_from_bundle(
+        self,
+        *,
+        symbol: str,
+        endpoint_to_raw: dict[str, dict[str, Any]] | None,
+        asof_ts: datetime | None = None,
+    ) -> FeatureExtractionResult:
+        """
+        Convenience: extract features from a dict keyed by endpoint name.
+        Expected endpoint keys (planner v1):
+          - real_time_quotation
+          - cmd_history_quotation
+          - high_frequency
+        Missing keys are tolerated (features degrade gracefully), but callers typically
+        require realtime+history before persisting a snapshot.
+        """
+        m = dict(endpoint_to_raw or {})
+        realtime_raw = m.get("real_time_quotation")
+        history_raw = m.get("cmd_history_quotation")
+        intraday_raw = m.get("high_frequency")
+
+        # If missing critical inputs, return a stable "empty" feature vector without raising.
+        if realtime_raw is None or history_raw is None:
+            sym = normalize_symbol(symbol)
+            features = {"symbol": sym, "missing_inputs": True}
+            feature_hash = sha256_hex(json.dumps(features, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+            return FeatureExtractionResult(features=features, feature_hash=feature_hash, asof_ts=asof_ts)
+
+        return self.extract(
+            symbol=symbol,
+            realtime_raw=realtime_raw,
+            history_raw=history_raw,
+            intraday_raw=intraday_raw,
+            asof_ts=asof_ts,
+        )

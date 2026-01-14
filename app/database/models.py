@@ -87,6 +87,7 @@ class DataRequest(Base):
     correlation_id = Column(String(64), nullable=True, index=True)
     account_id = Column(String(32), nullable=True, index=True)
 
+    # IMPORTANT: allow NULL, but never allow empty string.
     symbol = Column(String(32), nullable=True, index=True)
     purpose = Column(String(32), nullable=False)  # PLAN/VERIFY/RESEARCH/INGEST
     provider = Column(String(32), nullable=False)  # IFIND_HTTP/MOCK/...
@@ -106,6 +107,8 @@ class DataRequest(Base):
     response_id = Column(String(32), nullable=True, index=True)
 
     __table_args__ = (
+        # No empty symbol; NULL is permitted for non-symbol requests.
+        CheckConstraint("(symbol IS NULL) OR (length(symbol) > 0)", name="ck_data_requests_symbol_not_empty"),
         Index("ix_data_requests_status_created", "status", "created_at"),
         Index("ix_data_requests_symbol_created", "symbol", "created_at"),
     )
@@ -236,7 +239,6 @@ class Signal(Base):
     __table_args__ = (Index("ix_signals_symbol_day", "symbol", "trading_day"),)
 
 
-
 class LabelingCandidate(Base):
     """Daily operator/analyst supplied candidates for next-day limit-up labeling (待打标).
 
@@ -321,8 +323,6 @@ class SymbolFeatureSnapshot(Base):
     __table_args__ = (
         Index("ix_feature_snapshots_symbol_asof", "symbol", "asof_ts"),
     )
-
-
 
 
 class DecisionBundle(Base):
@@ -653,7 +653,6 @@ class SystemStatus(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (CheckConstraint("id = 1", name="ck_system_status_singleton"),)
-
 
 
 class RuntimeControls(Base):

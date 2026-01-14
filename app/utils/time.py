@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 SH_TZ = ZoneInfo("Asia/Shanghai")
+UTC_TZ = ZoneInfo("UTC")
 
 
 def now_shanghai() -> datetime:
@@ -11,9 +12,26 @@ def now_shanghai() -> datetime:
 
 
 def to_shanghai(dt: datetime) -> datetime:
+    """
+    Convert datetime to Asia/Shanghai.
+
+    Contract:
+    - If dt is naive, treat it as Asia/Shanghai local time (NOT UTC).
+      This matches the project rule: "all times unified to Asia/Shanghai".
+    """
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=SH_TZ)
     return dt.astimezone(SH_TZ)
+
+
+def to_utc(dt: datetime) -> datetime:
+    """
+    Convert datetime to UTC.
+
+    Contract:
+    - If dt is naive, treat it as Asia/Shanghai local time.
+    """
+    return to_shanghai(dt).astimezone(UTC_TZ)
 
 
 def fmt_ts_millis(dt: datetime) -> str:

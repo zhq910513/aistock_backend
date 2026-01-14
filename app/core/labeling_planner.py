@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 from app.config import settings
 from app.utils.symbols import normalize_symbol
-from app.utils.time import now_shanghai, trading_day_str
+from app.utils.time import now_shanghai, now_shanghai_str, trading_day_str
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,8 @@ class PlannedRequest:
     params_canonical: str
     payload: dict
     deadline_sec: int
+    # IMPORTANT: symbol must be carried end-to-end so DataRequest.symbol is never empty.
+    symbol: str
 
 
 @dataclass(frozen=True)
@@ -95,7 +97,8 @@ def build_plan(
     # Expand history / high-frequency depth with hit_count, but cap it.
     hist_days = min(
         int(settings.LABELING_HISTORY_DAYS_MAX),
-        int(settings.LABELING_HISTORY_DAYS_BASE) + max(0, int(hit_count) - 1) * int(settings.LABELING_HISTORY_DAYS_EXPAND),
+        int(settings.LABELING_HISTORY_DAYS_BASE)
+        + max(0, int(hit_count) - 1) * int(settings.LABELING_HISTORY_DAYS_EXPAND),
     )
     hf_limit = max(1, int(settings.LABELING_HF_LIMIT_BASE))
 
@@ -109,7 +112,8 @@ def build_plan(
             "hit_count": int(hit_count),
             "hist_days": int(hist_days),
             "hf_limit": int(hf_limit),
-            "built_at": now_shanghai().strftime("%Y-%m-%d %H:%M:%S"),
+            # project convention: Asia/Shanghai with milliseconds
+            "built_at": now_shanghai_str(),
         }
     )
 
@@ -117,6 +121,9 @@ def build_plan(
     rt_payload = {
         "codes": sym,
         "indicators": "latest,open,high,low,preClose,amt,vol,changeRatio",
+        # compatibility: many downstreams treat thscode/symbol as canonical symbol key
+        "thscode": sym,
+        "symbol": sym,
     }
     pc_rt = _params_canonical(rt_payload)
     dk_rt = _mk_dedupe_key(td, "real_time_quotation", pc_rt)
@@ -129,6 +136,8 @@ def build_plan(
         "startdate": startdate,
         "enddate": enddate,
         "functionpara": {"Fill": "Blank"},
+        "thscode": sym,
+        "symbol": sym,
     }
     pc_hist = _params_canonical(hist_payload)
     dk_hist = _mk_dedupe_key(td, "cmd_history_quotation", pc_hist)
@@ -140,6 +149,8 @@ def build_plan(
         "indicators": "open,high,low,close,volume,amount,changeRatio",
         "starttime": starttime,
         "endtime": endtime,
+        "thscode": sym,
+        "symbol": sym,
     }
     pc_hf = _params_canonical(hf_payload)
     dk_hf = _mk_dedupe_key(td, "high_frequency", pc_hf)
@@ -154,6 +165,7 @@ def build_plan(
             params_canonical=pc_rt,
             payload=rt_payload,
             deadline_sec=5,
+            symbol=sym,
         ),
         PlannedRequest(
             dedupe_key=dk_hist,
@@ -163,6 +175,7 @@ def build_plan(
             params_canonical=pc_hist,
             payload=hist_payload,
             deadline_sec=8,
+            symbol=sym,
         ),
         PlannedRequest(
             dedupe_key=dk_hf,
@@ -172,6 +185,7 @@ def build_plan(
             params_canonical=pc_hf,
             payload=hf_payload,
             deadline_sec=10,
+            symbol=sym,
         ),
     ]
 

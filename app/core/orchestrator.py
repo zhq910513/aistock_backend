@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
@@ -19,7 +19,7 @@ from app.core.exit_monitor import ExitMonitor
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
 from app.database import models
-from app.utils.time import now_shanghai, trading_day_str, fmt_ts_millis, to_shanghai
+from app.utils.time import now_shanghai, trading_day_str, fmt_ts_millis
 from app.utils.ids import make_cid
 from app.utils.crypto import sha256_hex
 from app.utils.p2 import P2Quantile
@@ -65,7 +65,6 @@ class Orchestrator:
         age = (now_shanghai() - st.last_self_check_time).total_seconds()
         return age <= float(settings.SELF_CHECK_MAX_AGE_SEC)
 
-
     def _execution_controls_ok(self, repo: Repo, symbol: str, account_id: str | None, data_status: str) -> tuple[bool, str]:
         """Runtime controls gate. Returns (ok, reason)."""
         c = repo.controls.get_for_update()
@@ -101,7 +100,6 @@ class Orchestrator:
             pass
 
         return True, "ok"
-
 
     async def _tick(self) -> None:
         tick_now = now_shanghai()
@@ -175,7 +173,7 @@ class Orchestrator:
                 )
 
                 # rewrite validation record with final decision_id (immutability via new record)
-                val_id = repo.validations.write(
+                _val_id = repo.validations.write(
                     decision_id=decision_id,
                     symbol=sym,
                     hypothesis=str(agent_dec.params.get("hypothesis", "")),
@@ -274,14 +272,14 @@ class Orchestrator:
                                 created_at=now_shanghai(),
                             )
                         )
-                
+
                     # bind decision->cid (best-effort) even if we don't execute an order
                     s.execute(
                         models.DecisionBundle.__table__.update()
                         .where(models.DecisionBundle.decision_id == decision_id)
                         .values(cid=cid)
                     )
-                
+
                     # Guard first (risk veto)
                     gr = self.guard.evaluate(s, sym, agent_dec.decision, intended_qty=100, account_id=account_id)
                     if gr.veto:
@@ -293,7 +291,7 @@ class Orchestrator:
                             payload={"guard_level": gr.guard_level, "veto_code": gr.veto_code, "account_id": account_id},
                         )
                         continue
-                
+
                     # Governance gate (PANIC/VETO + SELF_CHECK)
                     if not self._trade_gate_ok(repo):
                         repo.system_events.write_event(
@@ -304,7 +302,7 @@ class Orchestrator:
                             payload={"reason": "guard_or_self_check"},
                         )
                         continue
-                
+
                     # Runtime execution controls (AUTO_TRADING, DRY_RUN, limits, allow/deny lists)
                     ctrl_ok, ctrl_reason = self._execution_controls_ok(repo, sym, account_id=account_id, data_status=raw_row.data_status)
                     if not ctrl_ok:
@@ -316,7 +314,7 @@ class Orchestrator:
                             payload={"reason": ctrl_reason, "account_id": account_id},
                         )
                         continue
-                
+
                     self.order_manager.create_order(
                         s=s,
                         cid=cid,
@@ -328,7 +326,7 @@ class Orchestrator:
                         qty=100,
                         strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
                     )
-                
+
                     # DRY_RUN means we create orders but do not submit to the outbox/broker
                     if not repo.controls.get_for_update().dry_run:
                         self.order_manager.submit(s, cid)
@@ -340,7 +338,6 @@ class Orchestrator:
                             symbol=sym,
                             payload={"note": "order created but not submitted (dry_run=true)", "account_id": account_id},
                         )
-
 
             s.commit()
 
@@ -456,7 +453,7 @@ class Orchestrator:
                 )
 
                 # best-effort lineage: latest market payload hash
-                last_ev = (
+                _last_ev = (
                     s4.execute(
                         select(models.RawMarketEvent)
                         .where(models.RawMarketEvent.symbol == symbol)

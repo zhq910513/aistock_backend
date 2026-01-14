@@ -4,12 +4,11 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Body
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
 from app.database import models
-from app.utils.time import now_shanghai_str, now_shanghai, to_shanghai, trading_day_str
+from app.utils.time import now_shanghai_str, now_shanghai, to_shanghai
 from app.utils.crypto import sha256_hex
 from app.utils.symbols import normalize_symbol
 from app.config import settings
@@ -36,8 +35,6 @@ def _parse_ui_day(day: str | None) -> tuple[str | None, datetime | None, datetim
     start = to_shanghai(dt).replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     return td, start, end
-
-
 
 
 @router.get("/health")
@@ -69,7 +66,7 @@ def run_self_check() -> dict:
     """
     with SessionLocal() as s:
         repo = Repo(s)
-        st = repo.system_status.get_for_update()
+        _st = repo.system_status.get_for_update()
 
         report = {
             "time": now_shanghai_str(),
@@ -172,7 +169,6 @@ def get_data_response(response_id: str) -> dict:
             "received_at": r.received_at.isoformat(),
             "raw": r.raw,
         }
-
 
 
 @router.get("/ui/signal_inputs")
@@ -299,12 +295,31 @@ def upsert_ui_signal_inputs(payload: dict = Body(...)) -> dict:
             symbol = normalize_symbol(str((it or {}).get("symbol") or "").strip())
             if not symbol:
                 continue
+
             wl = repo.watchlist.upsert_hit(symbol=symbol, trading_day=td)
+
             if settings.LABELING_AUTO_FETCH_ENABLED and wl.active:
                 plan = build_plan(symbol=symbol, hit_count=int(wl.hit_count), planner_state=dict(wl.planner_state or {}))
                 # Persist planner state back
                 wl.planner_state = plan.planner_state
+
                 for pr in plan.requests:
+                    # HARD GUARANTEE:
+                    # planned request must carry symbol; do not let repo enqueue_planned see symbol=None/""
+                    try:
+                        setattr(pr, "symbol", symbol)
+                    except Exception:
+                        pass
+
+                    # also ensure payload contains thscode/symbol if it is a dict (provider adapters often rely on it)
+                    try:
+                        pld = getattr(pr, "payload", None)
+                        if isinstance(pld, dict):
+                            pld.setdefault("thscode", symbol)
+                            pld.setdefault("symbol", symbol)
+                    except Exception:
+                        pass
+
                     _rid, created = repo.data_requests.enqueue_planned(pr, provider=settings.DATA_PROVIDER)
                     if created:
                         planned += 1
@@ -317,6 +332,7 @@ def upsert_ui_signal_inputs(payload: dict = Body(...)) -> dict:
         "target_day": datetime.strptime(target_td, "%Y%m%d").strftime("%Y-%m-%d"),
         **res,
     }
+
 
 @router.get("/ui/controls")
 def ui_controls() -> dict:
@@ -363,7 +379,6 @@ def ui_controls_patch(payload: dict) -> dict:
         return updated
 
 
-
 @router.get("/ui/watchlist")
 def ui_watchlist(limit: int = 200) -> list[dict]:
     with SessionLocal() as s:
@@ -406,7 +421,7 @@ def ui_watchlist_patch(symbol: str, payload: dict = Body(...)) -> dict:
 
 @router.get("/ui/symbol/{symbol}/snapshots")
 def ui_symbol_snapshots(symbol: str, limit: int = 50) -> list[dict]:
-    symbol = (symbol or "").strip()
+    symbol = normalize_symbol((symbol or "").strip())
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol required")
     with SessionLocal() as s:
