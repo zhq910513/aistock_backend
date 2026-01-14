@@ -3,16 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Body
-from sqlalchemy import select
+from sqlalchemy import select, func, update
 
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
 from app.database import models
-from app.utils.time import now_shanghai_str, now_shanghai, to_shanghai
+from app.utils.time import now_shanghai_str, now_shanghai, to_shanghai, trading_day_str
 from app.utils.crypto import sha256_hex
 from app.utils.symbols import normalize_symbol
 from app.config import settings
 from app.core.labeling_planner import build_plan
+from app.adapters.pool_fetcher import fetch_limitup_pool
+from app.core.recommender_v1 import generate_for_batch, persist_decisions
 
 
 router = APIRouter()
@@ -90,6 +92,425 @@ def run_self_check() -> dict:
         )
         s.commit()
         return {"ok": True, "report_hash": report_hash, "report": report}
+
+
+@router.get("/admin/pool_rules")
+def get_pool_rules() -> dict:
+    """Inspect current effective pool filter rules.
+
+    Note: switching the rules source (ENV/DB/VERSIONED) is controlled by env var POOL_RULES_SOURCE.
+    """
+    from app.core.orchestrator import get_pool_filter_rules
+
+    with SessionLocal() as s:
+        prefixes, exchanges, meta = get_pool_filter_rules(s)
+        return {
+            "pool_rules_source": (settings.POOL_RULES_SOURCE or "ENV").upper(),
+            "effective": meta,
+            "allowed_prefixes": sorted(list(prefixes)),
+            "allowed_exchanges": sorted(list(exchanges)),
+            "time": now_shanghai_str(),
+        }
+
+
+@router.put("/admin/pool_rules")
+def set_pool_rules(payload: dict = Body(...)) -> dict:
+    """Update DB-backed pool rules (方案2).
+
+    Takes either CSV strings or lists:
+      {"allowed_prefixes": "0,6", "allowed_exchanges": ["SZ","SH"]}
+    """
+    def _to_list(v) -> list[str]:
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x).strip().upper() for x in v if str(x).strip()]
+        if isinstance(v, str):
+            return [x.strip().upper() for x in v.split(",") if x.strip()]
+        return [str(v).strip().upper()] if str(v).strip() else []
+
+    prefixes = _to_list(payload.get("allowed_prefixes"))
+    exchanges = _to_list(payload.get("allowed_exchanges"))
+    if not prefixes and not exchanges:
+        raise HTTPException(status_code=400, detail="allowed_prefixes/allowed_exchanges is required")
+
+    with SessionLocal() as s:
+        repo = Repo(s)
+        if prefixes:
+            repo.system_settings.set("pool.allowed_prefixes", prefixes)
+        if exchanges:
+            repo.system_settings.set("pool.allowed_exchanges", exchanges)
+        s.commit()
+
+    return {
+        "ok": True,
+        "saved": {
+            "pool.allowed_prefixes": prefixes or None,
+            "pool.allowed_exchanges": exchanges or None,
+        },
+        "note": "Effective only when POOL_RULES_SOURCE is DB or VERSIONED(fallback).",
+    }
+
+
+@router.post("/admin/pool_rulesets")
+def create_pool_ruleset(payload: dict = Body(...)) -> dict:
+    """Create a versioned pool filter rule set (方案3).
+
+    Payload:
+      {
+        "allowed_prefixes": ["0","6"],
+        "allowed_exchanges": "SZ,SH",
+        "effective_ts": "2026-01-15 16:00:00",
+        "note": "expand to SH"
+      }
+    """
+    def _to_list(v) -> list[str]:
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x).strip().upper() for x in v if str(x).strip()]
+        if isinstance(v, str):
+            return [x.strip().upper() for x in v.split(",") if x.strip()]
+        return [str(v).strip().upper()] if str(v).strip() else []
+
+    prefixes = _to_list(payload.get("allowed_prefixes"))
+    exchanges = _to_list(payload.get("allowed_exchanges"))
+    if not prefixes or not exchanges:
+        raise HTTPException(status_code=400, detail="allowed_prefixes and allowed_exchanges are required")
+
+    eff = payload.get("effective_ts")
+    if eff:
+        try:
+            # accept YYYY-MM-DD HH:MM:SS or ISO
+            if isinstance(eff, str) and "T" in eff:
+                dt = datetime.fromisoformat(eff)
+            elif isinstance(eff, str) and len(eff.strip()) <= 10:
+                dt = datetime.strptime(eff.strip(), "%Y-%m-%d")
+            else:
+                dt = datetime.strptime(str(eff).strip(), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            raise HTTPException(status_code=400, detail="effective_ts invalid; use ISO or 'YYYY-MM-DD HH:MM:SS'")
+        dt = to_shanghai(dt)
+    else:
+        dt = now_shanghai()
+
+    note = str(payload.get("note") or "")
+
+    with SessionLocal() as s:
+        repo = Repo(s)
+        row = repo.pool_filter_rules.create(prefixes, exchanges, dt, note=note)
+        s.commit()
+
+        return {
+            "ok": True,
+            "rule_set_id": row.rule_set_id,
+            "allowed_prefixes": list(row.allowed_prefixes or []),
+            "allowed_exchanges": list(row.allowed_exchanges or []),
+            "effective_ts": row.effective_ts.isoformat(),
+            "note": row.note,
+            "hint": "Set POOL_RULES_SOURCE=VERSIONED to make this take effect automatically.",
+        }
+
+
+@router.get("/admin/pool_rulesets")
+def list_pool_rulesets(limit: int = 50) -> list[dict]:
+    with SessionLocal() as s:
+        repo = Repo(s)
+        rows = repo.pool_filter_rules.list_recent(limit=limit)
+        return [
+            {
+                "rule_set_id": r.rule_set_id,
+                "allowed_prefixes": list(r.allowed_prefixes or []),
+                "allowed_exchanges": list(r.allowed_exchanges or []),
+                "effective_ts": r.effective_ts.isoformat(),
+                "note": r.note,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+# ---------------------------
+# Candidate pool (Canonical Schema v1)
+# ---------------------------
+
+
+@router.post("/pool/fetch_now")
+def pool_fetch_now() -> dict:
+    """Manual trigger: fetch external candidate pool immediately (for ops/testing)."""
+    res = fetch_limitup_pool()
+
+    # reuse the same filtering rule as orchestrator
+    from app.core.orchestrator import _filter_and_normalize_items, get_pool_filter_rules
+    td = trading_day_str(now_shanghai())
+    with SessionLocal() as s:
+        allowed_prefixes, allowed_exchanges, rules = get_pool_filter_rules(s)
+    filtered = _filter_and_normalize_items(res.items, allowed_prefixes, allowed_exchanges)
+    batch_id = sha256_hex(f"{td}|{settings.POOL_FETCH_URL}|{res.raw_hash}".encode("utf-8"))[:32]
+
+    with SessionLocal() as s:
+        # idempotent: if exists, return existing summary
+        b = s.get(models.LimitupPoolBatch, batch_id)
+        if b is None:
+            s.add(
+                models.LimitupPoolBatch(
+                    batch_id=batch_id,
+                    trading_day=td,
+                    fetch_ts=now_shanghai(),
+                    source="EXTERNAL",
+                    status="EDITING",
+                    filter_rules=rules,
+                    raw_hash=res.raw_hash,
+                )
+            )
+            s.flush()
+            for it in filtered:
+                s.add(
+                    models.LimitupCandidate(
+                        batch_id=batch_id,
+                        symbol=normalize_symbol(str(it.get("symbol") or it.get("code") or "")),
+                        name=str(it.get("name") or ""),
+                        p_limit_up=None,
+                        p_source="UI",
+                        edited_ts=None,
+                        candidate_status="PENDING_EDIT",
+                        raw_json=it,
+                    )
+                )
+            s.commit()
+
+        cnt = (
+            s.execute(select(func.count(models.LimitupCandidate.id)).where(models.LimitupCandidate.batch_id == batch_id)).scalar_one()
+        )
+        return {
+            "batch_id": batch_id,
+            "trading_day": datetime.strptime(td, "%Y%m%d").strftime("%Y-%m-%d"),
+            "status": (b.status if b else "EDITING"),
+            "raw_hash": res.raw_hash,
+            "filtered_count": int(cnt or 0),
+            "filter_rules": rules,
+        }
+
+
+@router.get("/pool/batches")
+def list_pool_batches(limit: int = 30, day: str | None = None) -> list[dict]:
+    """List pool batches."""
+    td, _, _ = _parse_ui_day(day)
+    with SessionLocal() as s:
+        q = select(models.LimitupPoolBatch).order_by(models.LimitupPoolBatch.fetch_ts.desc())
+        if td:
+            q = q.where(models.LimitupPoolBatch.trading_day == td)
+        rows = s.execute(q.limit(limit)).scalars().all()
+        return [
+            {
+                "batch_id": r.batch_id,
+                "trading_day": datetime.strptime(r.trading_day, "%Y%m%d").strftime("%Y-%m-%d"),
+                "fetch_ts": r.fetch_ts.isoformat(),
+                "source": r.source,
+                "status": r.status,
+                "filter_rules": r.filter_rules,
+                "raw_hash": r.raw_hash,
+            }
+            for r in rows
+        ]
+
+
+@router.get("/pool/batches/{batch_id}/candidates")
+def list_pool_candidates(batch_id: str, limit: int = 500) -> list[dict]:
+    with SessionLocal() as s:
+        rows = (
+            s.execute(
+                select(models.LimitupCandidate)
+                .where(models.LimitupCandidate.batch_id == batch_id)
+                .order_by(models.LimitupCandidate.p_limit_up.desc().nullslast())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        return [
+            {
+                "batch_id": r.batch_id,
+                "symbol": normalize_symbol(r.symbol),
+                "name": r.name,
+                "p_limit_up": (float(r.p_limit_up) if r.p_limit_up is not None else None),
+                "p_source": r.p_source,
+                "edited_ts": r.edited_ts.isoformat() if r.edited_ts else None,
+                "candidate_status": r.candidate_status,
+                "raw_json": r.raw_json,
+            }
+            for r in rows
+        ]
+
+
+@router.patch("/pool/batches/{batch_id}/candidates/{symbol}")
+def update_pool_candidate(batch_id: str, symbol: str, payload: dict = Body(...)) -> dict:
+    """Update operator-edited fields (p_limit_up) for a candidate."""
+    p = payload.get("p_limit_up")
+    if p is None:
+        raise HTTPException(status_code=400, detail="p_limit_up is required")
+    try:
+        pf = float(p)
+    except Exception:
+        raise HTTPException(status_code=400, detail="p_limit_up must be a number")
+    if not (0.0 <= pf <= 1.0):
+        raise HTTPException(status_code=400, detail="p_limit_up must be in [0,1]")
+
+    sym = normalize_symbol(symbol)
+    with SessionLocal() as s:
+        row = (
+            s.execute(
+                select(models.LimitupCandidate)
+                .where(models.LimitupCandidate.batch_id == batch_id)
+                .where(models.LimitupCandidate.symbol == sym)
+            )
+            .scalars()
+            .first()
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="candidate_not_found")
+
+        # mark batch as EDITING on first operator edit
+        b = s.get(models.LimitupPoolBatch, batch_id)
+        if b is not None and b.status == "FETCHED":
+            b.status = "EDITING"
+
+
+        row.p_limit_up = pf
+        row.p_source = str(payload.get("p_source") or "UI")
+        row.edited_ts = now_shanghai()
+        # once edited, mark READY unless explicitly dropped
+        if str(payload.get("candidate_status") or "").strip():
+            row.candidate_status = str(payload.get("candidate_status")).strip()
+        elif row.candidate_status != "DROPPED":
+            row.candidate_status = "READY"
+
+        s.commit()
+        return {
+            "batch_id": batch_id,
+            "symbol": sym,
+            "p_limit_up": float(row.p_limit_up),
+            "candidate_status": row.candidate_status,
+            "edited_ts": row.edited_ts.isoformat() if row.edited_ts else None,
+        }
+
+
+@router.post("/pool/batches/{batch_id}/commit")
+def commit_pool_batch(batch_id: str) -> dict:
+    """Commit a batch and immediately generate recommendations (P0 v1)."""
+    with SessionLocal() as s:
+        b = s.get(models.LimitupPoolBatch, batch_id)
+        if b is None:
+            raise HTTPException(status_code=404, detail="batch_not_found")
+        if b.status == "CANCELLED":
+            raise HTTPException(status_code=400, detail="batch_cancelled")
+
+
+        # Require at least one READY candidate with p_limit_up filled
+        ready_cnt = (
+            s.execute(
+                select(func.count())
+                .select_from(models.LimitupCandidate)
+                .where(models.LimitupCandidate.batch_id == batch_id)
+                .where(models.LimitupCandidate.candidate_status == "READY")
+                .where(models.LimitupCandidate.p_limit_up.is_not(None))
+            )
+            .scalar_one()
+        )
+        if int(ready_cnt or 0) <= 0:
+            raise HTTPException(status_code=400, detail="no_ready_candidates")
+
+        # Drop any remaining PENDING_EDIT candidates to keep the batch auditable
+        s.execute(
+            update(models.LimitupCandidate)
+            .where(models.LimitupCandidate.batch_id == batch_id)
+            .where(models.LimitupCandidate.candidate_status == "PENDING_EDIT")
+            .values(candidate_status="DROPPED")
+        )
+        # mark batch committed
+        b.status = "COMMITTED"
+        s.flush()
+
+        # generate recommendations now
+        items = generate_for_batch(s, b)
+        persist_decisions(s, b, items)
+        s.commit()
+
+        return {
+            "batch_id": b.batch_id,
+            "trading_day": datetime.strptime(b.trading_day, "%Y%m%d").strftime("%Y-%m-%d"),
+            "status": b.status,
+            "recommendation_count": len(items),
+        }
+
+
+@router.get("/recommendations")
+def list_recommendations(limit: int = 50, day: str | None = None) -> list[dict]:
+    """User-facing recommendations (TopN by score).
+
+    day: decision_day (T+1) in YYYY-MM-DD or YYYYMMDD.
+    If not provided, defaults to tomorrow (relative to Shanghai time).
+    """
+    if not day:
+        td = trading_day_str(now_shanghai() + timedelta(days=1))
+    else:
+        td, _, _ = _parse_ui_day(day)
+        if not td:
+            raise HTTPException(status_code=400, detail="Invalid day. Use YYYY-MM-DD or YYYYMMDD.")
+        # /_parse_ui_day returns trading_day; for recommendations we interpret as decision_day
+
+    decision_day = td
+
+    with SessionLocal() as s:
+        decs = (
+            s.execute(
+                select(models.ModelDecision)
+                .where(models.ModelDecision.decision_day == decision_day)
+                .order_by(models.ModelDecision.score.desc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+
+        if not decs:
+            return []
+
+        ids = [d.decision_id for d in decs]
+        ev_rows = (
+            s.execute(select(models.DecisionEvidence).where(models.DecisionEvidence.decision_id.in_(ids)))
+            .scalars()
+            .all()
+        )
+        ev_by_id: dict[str, list[models.DecisionEvidence]] = {}
+        for ev in ev_rows:
+            ev_by_id.setdefault(ev.decision_id, []).append(ev)
+
+        out: list[dict] = []
+        for d in decs:
+            evs = ev_by_id.get(d.decision_id, [])
+            out.append(
+                {
+                    "decision_id": d.decision_id,
+                    "trading_day": datetime.strptime(d.trading_day, "%Y%m%d").strftime("%Y-%m-%d"),
+                    "decision_day": datetime.strptime(d.decision_day, "%Y%m%d").strftime("%Y-%m-%d"),
+                    "symbol": normalize_symbol(d.symbol),
+                    "action": d.action,
+                    "score": float(d.score),
+                    "confidence": float(d.confidence),
+                    "evidence": [
+                        {
+                            "reason_code": e.reason_code,
+                            "reason_text": e.reason_text,
+                            "evidence_fields": e.evidence_fields,
+                            "evidence_refs": e.evidence_refs,
+                        }
+                        for e in evs
+                    ],
+                    "created_ts": d.created_ts.isoformat(),
+                }
+            )
+        return out
 
 
 @router.get("/decisions")
@@ -332,51 +753,6 @@ def upsert_ui_signal_inputs(payload: dict = Body(...)) -> dict:
         "target_day": datetime.strptime(target_td, "%Y%m%d").strftime("%Y-%m-%d"),
         **res,
     }
-
-
-@router.get("/ui/controls")
-def ui_controls() -> dict:
-    with SessionLocal() as s:
-        repo = Repo(s)
-        st = repo.system_status.get_for_update()
-        c = repo.controls.get_for_update()
-
-        self_check_valid_until = None
-        if st.last_self_check_time:
-            self_check_valid_until = (st.last_self_check_time + timedelta(seconds=int(settings.SELF_CHECK_MAX_AGE_SEC))).isoformat()
-
-        # best-effort: "data_degraded" not fully modeled yet (defaults to False)
-        resp = {
-            # writable
-            "auto_trading_enabled": bool(c.auto_trading_enabled),
-            "dry_run": bool(c.dry_run),
-            "only_when_data_ok": bool(c.only_when_data_ok),
-            "max_orders_per_day": int(c.max_orders_per_day),
-            "max_notional_per_order": int(c.max_notional_per_order),
-            "allowed_symbols": list(c.allowed_symbols or []),
-            "blocked_symbols": list(c.blocked_symbols or []),
-
-            # readonly status / governance
-            "panic_halt": bool(st.panic_halt),
-            "guard_level": int(st.guard_level),
-            "veto": bool(st.veto),
-            "veto_code": st.veto_code,
-            "data_degraded": False,
-            "self_check_valid_until": self_check_valid_until,
-            "ths_mode": settings.THS_MODE,
-            "time": now_shanghai_str(),
-        }
-        s.commit()
-        return resp
-
-
-@router.patch("/ui/controls")
-def ui_controls_patch(payload: dict) -> dict:
-    with SessionLocal() as s:
-        repo = Repo(s)
-        updated = repo.controls.patch(payload or {})
-        s.commit()
-        return updated
 
 
 @router.get("/ui/watchlist")

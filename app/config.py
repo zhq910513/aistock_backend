@@ -17,12 +17,43 @@ class Settings(BaseSettings):
     # Orchestrator background loop is optional for API-only deployments/testing.
     START_ORCHESTRATOR: bool = False
 
+    # HARD BOUNDARY (v1整改要求):
+    # 本轮必须禁用任何自动下单/交易执行链路。即便代码残留，也不得被运行路径触达。
+    EXECUTION_DISABLED: bool = True
+
     # --- Database ---
     DATABASE_URL: str = "sqlite:////app/db/aistock.sqlite3"
 
     # --- Data sources ---
     DATA_PROVIDER: str = "IFIND_HTTP"
     THS_MODE: str = "MOCK"
+
+    # --- Limit-up candidate pool (T+0 16:00) ---
+    # 说明：候选池接口由外部提供；本服务仅负责定时拉取、过滤、落库、供UI编辑。
+    POOL_FETCH_ENABLED: bool = True
+    POOL_FETCH_AT_HHMM: str = "16:00"  # Asia/Shanghai
+
+    # Candidate pool endpoint
+    POOL_FETCH_URL: str = ""
+    # Optional HTTP method: GET/POST
+    POOL_FETCH_METHOD: str = "GET"
+    # Optional headers/body as JSON strings (kept as str to avoid env parsing surprises)
+    POOL_FETCH_HEADERS_JSON: str = "{}"
+    POOL_FETCH_BODY_JSON: str = "{}"
+
+    # Filter rules (configurable)
+    POOL_ALLOWED_PREFIXES: str = "0"          # e.g. "0" or "0,6"
+    POOL_ALLOWED_EXCHANGES: str = "SZ"        # e.g. "SZ" or "SZ,SH"
+
+    # Pool filter rules source
+    # - ENV: use POOL_ALLOWED_PREFIXES / POOL_ALLOWED_EXCHANGES
+    # - DB: read from system_settings (pool.allowed_prefixes / pool.allowed_exchanges)
+    # - VERSIONED: read from pool_filter_rule_sets (effective_ts based), fallback to DB/ENV
+    POOL_RULES_SOURCE: str = "ENV"
+
+    # --- Recommendation output ---
+    RECOMMEND_TOPN: int = 10
+    RECOMMEND_DEADLINE_HHMM: str = "08:30"    # T+1 deadline
 
     IFIND_HTTP_BASE_URL: str = "https://quantapi.51ifind.com"
     IFIND_HTTP_REFRESH_TOKEN: str = ""

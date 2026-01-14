@@ -268,6 +268,100 @@ class LabelingCandidate(Base):
     )
 
 
+# ---------------------------
+# Canonical Schema v1: limit-up candidate pool (input layer)
+# ---------------------------
+
+
+class LimitupPoolBatch(Base):
+    """Daily batch for the external limit-up candidate pool."""
+
+    __tablename__ = "limitup_pool_batches"
+
+    batch_id = Column(String(64), primary_key=True)
+    trading_day = Column(String(8), nullable=False, index=True)  # YYYYMMDD (Asia/Shanghai)
+    fetch_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    source = Column(String(64), nullable=False, default="EXTERNAL")
+
+    # FETCHED / EDITING / COMMITTED / CANCELLED
+    status = Column(String(16), nullable=False, default="FETCHED", index=True)
+    filter_rules = Column(JSON, nullable=False, default=dict)
+    raw_hash = Column(String(64), nullable=False)
+
+    __table_args__ = (
+        Index("ix_limitup_pool_batches_day_status", "trading_day", "status"),
+    )
+
+
+class LimitupCandidate(Base):
+    """Filtered candidates belonging to a batch."""
+
+    __tablename__ = "limitup_candidates"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    batch_id = Column(String(64), ForeignKey("limitup_pool_batches.batch_id", ondelete="CASCADE"), nullable=False, index=True)
+    symbol = Column(String(32), nullable=False, index=True)
+    name = Column(String(128), nullable=False, default="")
+
+    # Operator editable
+    p_limit_up = Column(Float, nullable=True)
+    p_source = Column(String(32), nullable=False, default="UI")
+    edited_ts = Column(DateTime(timezone=True), nullable=True)
+
+    # PENDING_EDIT / READY / DROPPED
+    candidate_status = Column(String(16), nullable=False, default="PENDING_EDIT", index=True)
+
+    raw_json = Column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", "symbol", name="uq_limitup_candidates_batch_symbol"),
+        Index("ix_limitup_candidates_batch_plimit", "batch_id", "p_limit_up"),
+    )
+
+
+# ---------------------------
+# Runtime settings / versioned pool filter rules
+# ---------------------------
+
+
+class SystemSetting(Base):
+    """Simple key-value settings store.
+
+    Used for "DB 配置"方案：可在前端动态改（管理员设置页）。
+    """
+
+    __tablename__ = "system_settings"
+
+    key = Column(String(128), primary_key=True)
+    value = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class PoolFilterRuleSet(Base):
+    """Versioned pool filter rules (方案3：可审计/可追溯).
+
+    Pipeline reads the latest rule set whose effective_ts <= now (Asia/Shanghai).
+    """
+
+    __tablename__ = "pool_filter_rule_sets"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    rule_set_id = Column(String(64), nullable=False, unique=True, index=True)
+
+    allowed_prefixes = Column(JSON, nullable=False, default=list)   # e.g. ["0", "6"]
+    allowed_exchanges = Column(JSON, nullable=False, default=list)  # e.g. ["SZ", "SH"]
+
+    effective_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    note = Column(String(256), nullable=False, default="")
+
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("ix_pool_filter_rules_effective", "effective_ts"),
+    )
+
+
 class SymbolWatchlist(Base):
     """Long-lived watchlist for symbols that repeatedly hit the labeling candidate criteria.
 
@@ -357,6 +451,82 @@ class DecisionBundle(Base):
     created_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (Index("ix_decision_symbol_time", "symbol", "created_at"),)
+
+
+# ---------------------------
+# Canonical Schema v1: user-facing decisions + evidence
+# ---------------------------
+
+
+class ModelDecision(Base):
+    __tablename__ = "model_decisions"
+
+    decision_id = Column(String(64), primary_key=True)
+
+    trading_day = Column(String(8), nullable=False, index=True)   # input day (T+0) YYYYMMDD
+    decision_day = Column(String(8), nullable=False, index=True)  # output day (T+1) YYYYMMDD
+
+    symbol = Column(String(32), nullable=False, index=True)
+    action = Column(String(8), nullable=False)  # BUY/WATCH/AVOID
+    score = Column(Float, nullable=False, default=0.0)
+    confidence = Column(Float, nullable=False, default=0.0)
+
+    created_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("decision_day", "symbol", name="uq_model_decisions_day_symbol"),
+        Index("ix_model_decisions_day_score", "decision_day", "score"),
+    )
+
+
+class DecisionEvidence(Base):
+    __tablename__ = "decision_evidence"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    decision_id = Column(String(64), ForeignKey("model_decisions.decision_id", ondelete="CASCADE"), nullable=False, index=True)
+
+    reason_code = Column(String(64), nullable=False)
+    reason_text = Column(String(512), nullable=False)
+
+    evidence_fields = Column(JSON, nullable=False, default=dict)
+    evidence_refs = Column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (
+        Index("ix_decision_evidence_decision", "decision_id"),
+    )
+
+
+class DecisionLabel(Base):
+    __tablename__ = "decision_labels"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    decision_id = Column(String(64), ForeignKey("model_decisions.decision_id", ondelete="CASCADE"), nullable=False, index=True)
+    label_day = Column(String(8), nullable=False, index=True)  # YYYYMMDD
+
+    hit_limitup = Column(Boolean, nullable=False, default=False)
+    close_return = Column(Float, nullable=False, default=0.0)
+    max_return = Column(Float, nullable=False, default=0.0)
+    drawdown = Column(Float, nullable=False, default=0.0)
+    error_tags = Column(JSON, nullable=False, default=list)
+
+    __table_args__ = (
+        UniqueConstraint("decision_id", "label_day", name="uq_decision_labels_decision_label_day"),
+    )
+
+
+class ModelMetricsDaily(Base):
+    __tablename__ = "model_metrics_daily"
+
+    trading_day = Column(String(8), primary_key=True)  # YYYYMMDD
+
+    hit_rate_at_k = Column(Float, nullable=True)
+    avg_return_at_k = Column(Float, nullable=True)
+    drawdown_at_k = Column(Float, nullable=True)
+    coverage = Column(Float, nullable=True)
+    brier_score = Column(Float, nullable=True)
+
+    extra = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False)
 
 
 class RuleSet(Base):

@@ -6,6 +6,8 @@ from datetime import timedelta
 import json
 
 from sqlalchemy import select
+from sqlalchemy import func
+from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -143,6 +145,80 @@ class ControlsRepo:
 
         c.updated_at = now_shanghai()
         return self.as_dict()
+
+
+@dataclass
+class SystemSettingsRepo:
+    s: Session
+
+    def get(self, key: str) -> dict | None:
+        row = self.s.get(models.SystemSetting, str(key))
+        return row.value if row else None
+
+    def set(self, key: str, value: dict | list | str | int | float | bool | None) -> None:
+        now = now_shanghai()
+        k = str(key)
+        row = self.s.get(models.SystemSetting, k)
+        payload = value
+        # Normalize into JSON-friendly structure
+        if isinstance(value, set):
+            payload = list(value)
+        if row is None:
+            self.s.add(models.SystemSetting(key=k, value=payload, updated_at=now))
+        else:
+            row.value = payload
+            row.updated_at = now
+
+
+@dataclass
+class PoolFilterRuleSetsRepo:
+    s: Session
+
+    def create(self, allowed_prefixes: list[str], allowed_exchanges: list[str], effective_ts, note: str = "") -> models.PoolFilterRuleSet:
+        # Deterministic id to avoid duplicates for the same effective_ts+rules
+        base = {
+            "allowed_prefixes": [str(x).upper() for x in (allowed_prefixes or []) if str(x).strip()],
+            "allowed_exchanges": [str(x).upper() for x in (allowed_exchanges or []) if str(x).strip()],
+            "effective_ts": to_shanghai(effective_ts).isoformat(),
+        }
+        rid = sha256_hex(json.dumps(base, ensure_ascii=False, sort_keys=True).encode("utf-8"))[:32]
+        now = now_shanghai()
+        row = (
+            self.s.execute(select(models.PoolFilterRuleSet).where(models.PoolFilterRuleSet.rule_set_id == rid)).scalars().first()
+        )
+        if row is not None:
+            return row
+        row = models.PoolFilterRuleSet(
+            rule_set_id=rid,
+            allowed_prefixes=base["allowed_prefixes"],
+            allowed_exchanges=base["allowed_exchanges"],
+            effective_ts=to_shanghai(effective_ts),
+            note=str(note or ""),
+            created_at=now,
+        )
+        self.s.add(row)
+        self.s.flush()
+        return row
+
+    def get_active(self, now_dt) -> models.PoolFilterRuleSet | None:
+        now_dt = to_shanghai(now_dt)
+        return (
+            self.s.execute(
+                select(models.PoolFilterRuleSet)
+                .where(models.PoolFilterRuleSet.effective_ts <= now_dt)
+                .order_by(models.PoolFilterRuleSet.effective_ts.desc(), models.PoolFilterRuleSet.id.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+
+    def list_recent(self, limit: int = 50) -> list[models.PoolFilterRuleSet]:
+        return (
+            self.s.execute(select(models.PoolFilterRuleSet).order_by(models.PoolFilterRuleSet.effective_ts.desc()).limit(limit))
+            .scalars()
+            .all()
+        )
 
 
 @dataclass
@@ -1006,6 +1082,14 @@ class Repo:
     @property
     def controls(self) -> ControlsRepo:
         return ControlsRepo(self.s)
+
+    @property
+    def system_settings(self) -> SystemSettingsRepo:
+        return SystemSettingsRepo(self.s)
+
+    @property
+    def pool_filter_rules(self) -> PoolFilterRuleSetsRepo:
+        return PoolFilterRuleSetsRepo(self.s)
 
     @property
     def accounts(self) -> AccountsRepo:
