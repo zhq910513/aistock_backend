@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 from datetime import timedelta
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -84,7 +85,6 @@ class SystemStatusRepo:
         st.updated_at = now_shanghai()
 
 
-
 @dataclass
 class ControlsRepo:
     s: Session
@@ -117,7 +117,6 @@ class ControlsRepo:
             if v is None:
                 return []
             if isinstance(v, str):
-                # allow comma-separated strings
                 return [x.strip() for x in v.split(",") if x.strip()]
             if isinstance(v, list):
                 return [str(x).strip() for x in v if str(x).strip()]
@@ -142,6 +141,7 @@ class ControlsRepo:
 
         c.updated_at = now_shanghai()
         return self.as_dict()
+
 
 @dataclass
 class AccountsRepo:
@@ -393,7 +393,6 @@ class StrategyContractsRepo:
         if row is not None:
             return
 
-        # Minimal default contract derived from settings (can be replaced by writing a new row with a new hash)
         definition = {
             "version": 1,
             "objective": {
@@ -425,6 +424,7 @@ class StrategyContractsRepo:
             self.ensure_seeded(strategy_contract_hash)
             row = self.s.get(models.StrategyContract, strategy_contract_hash)
         return dict(row.definition or {}) if row is not None else {}
+
 
 @dataclass
 class DataRequestsRepo:
@@ -472,6 +472,30 @@ class DataRequestsRepo:
             )
         )
         return rid
+
+    def enqueue_planned(self, pr: Any, provider: str) -> tuple[str, bool]:
+        """
+        Compatibility helper: accept PlannedRequest (labeling_planner.PlannedRequest) and enqueue once.
+        Returns (request_id, created_bool).
+        """
+        dedupe_key = str(getattr(pr, "dedupe_key"))
+        existing = self.s.execute(select(models.DataRequest).where(models.DataRequest.dedupe_key == dedupe_key)).scalar_one_or_none()
+        if existing is not None:
+            return str(existing.request_id), False
+
+        rid = self.enqueue(
+            dedupe_key=dedupe_key,
+            correlation_id=getattr(pr, "correlation_id", None),
+            account_id=None,
+            symbol=getattr(pr, "symbol", None),
+            purpose=str(getattr(pr, "purpose", "")),
+            provider=provider,
+            endpoint=str(getattr(pr, "endpoint")),
+            params_canonical=str(getattr(pr, "params_canonical", "")),
+            request_payload=getattr(pr, "payload", {}) or {},
+            deadline_sec=int(getattr(pr, "deadline_sec", 0) or 0) or None,
+        )
+        return rid, True
 
     def fetch_pending(self, limit: int = 50) -> list[models.DataRequest]:
         return (
@@ -579,16 +603,11 @@ class ValidationsRepo:
         return vid
 
 
-
 @dataclass
 class LabelingCandidatesRepo:
     s: Session
 
     def upsert_batch(self, trading_day: str, target_day: str, items: list[dict[str, Any]], source: str = "UI") -> dict[str, int]:
-        """Upsert labeling candidates for a given day.
-
-        Returns: {"created": n, "updated": n, "total": n}
-        """
         created = 0
         updated = 0
 
@@ -603,7 +622,6 @@ class LabelingCandidatesRepo:
             except Exception:
                 continue
 
-            # allow "23.5" meaning 23.5%
             if p > 1.0 and p <= 100.0:
                 p = p / 100.0
             p = max(0.0, min(1.0, p))
@@ -655,8 +673,6 @@ class LabelingCandidatesRepo:
         return list(self.s.execute(q).scalars().all())
 
 
-
-
 @dataclass
 class WatchlistRepo:
     s: Session
@@ -672,7 +688,7 @@ class WatchlistRepo:
                 hit_count=1,
                 active=True,
                 planner_state={},
-                next_refresh_at=now,  # schedule immediately
+                next_refresh_at=now,
                 created_at=now,
                 updated_at=now,
             )
@@ -683,23 +699,29 @@ class WatchlistRepo:
         row.last_seen_day = trading_day
         row.hit_count = int(row.hit_count or 0) + 1
         row.updated_at = now
-        # schedule sooner if active
         if row.active:
             cur = row.next_refresh_at
             if cur is not None:
+                # IMPORTANT: unify tz before comparing (DB may store naive datetime)
                 try:
                     cur = to_shanghai(cur)
                 except Exception:
-                    # fallback: schedule immediately
                     cur = now
             row.next_refresh_at = min(cur or now, now)
         return row
+
+    # ---- compatibility aliases (older code may call these) ----
+    def upsert_seen(self, symbol: str, trading_day: str) -> models.SymbolWatchlist:
+        return self.upsert_hit(symbol=symbol, trading_day=trading_day)
+
+    def list_due(self, max_symbols: int = 50) -> list[models.SymbolWatchlist]:
+        return self.due_for_refresh(max_symbols=max_symbols)
+    # ---------------------------------------------------------
 
     def set_active(self, symbol: str, active: bool) -> models.SymbolWatchlist:
         now = now_shanghai()
         row = self.s.get(models.SymbolWatchlist, symbol)
         if row is None:
-            # Create a minimal record if missing
             td = trading_day_str(now)
             row = models.SymbolWatchlist(
                 symbol=symbol,
@@ -730,7 +752,15 @@ class WatchlistRepo:
             .all()
         )
 
-    def due_for_refresh(self, limit: int = 50) -> list[models.SymbolWatchlist]:
+    def due_for_refresh(self, limit: int = 50, max_symbols: int | None = None) -> list[models.SymbolWatchlist]:
+        """
+        Return active watchlist rows due for refresh.
+
+        Compatibility: labeling_pipeline may call due_for_refresh(max_symbols=...).
+        """
+        if max_symbols is not None:
+            limit = int(max_symbols)
+
         now = now_shanghai()
         return (
             self.s.execute(
@@ -772,7 +802,6 @@ class FeatureSnapshotsRepo:
         request_ids: list[str],
         planner_version: str = "planner_v1",
     ) -> str:
-        # Snapshot id is deterministic to avoid duplicates on retries.
         material = f"{symbol}|{feature_set}|{asof_ts.isoformat()}|{sha256_hex(str(features).encode('utf-8'))}"
         sid = sha256_hex(material.encode("utf-8"))[:64]
         row = self.s.get(models.SymbolFeatureSnapshot, sid)
@@ -816,6 +845,8 @@ class FeatureSnapshotsRepo:
             .scalars()
             .first()
         )
+
+
 @dataclass
 class Repo:
     s: Session
@@ -831,7 +862,6 @@ class Repo:
     @property
     def controls(self) -> ControlsRepo:
         return ControlsRepo(self.s)
-
 
     @property
     def accounts(self) -> AccountsRepo:
@@ -868,7 +898,6 @@ class Repo:
     @property
     def strategy_contracts(self) -> StrategyContractsRepo:
         return StrategyContractsRepo(self.s)
-
 
     @property
     def frozen_versions(self) -> FrozenVersionsRepo:
