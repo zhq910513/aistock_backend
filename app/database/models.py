@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -13,6 +15,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     PrimaryKeyConstraint,
+    Text,
 )
 from sqlalchemy import JSON
 from sqlalchemy.orm import declarative_base, relationship
