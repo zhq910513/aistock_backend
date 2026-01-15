@@ -19,6 +19,11 @@ from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
 
+# IMPORTANT (SQLite autoincrement):
+# SQLite only auto-increments when the PRIMARY KEY column is exactly "INTEGER PRIMARY KEY".
+# Using BIGINT for an autoincrement PK will NOT bind to rowid and will fail inserts (id stays NULL).
+AUTO_PK = Integer().with_variant(BigInteger, "postgresql")
+
 
 # ---------------------------
 # Accounts
@@ -40,8 +45,7 @@ class Account(Base):
 class RawMarketEvent(Base):
     __tablename__ = "raw_market_events"
 
-    # SQLite autoincrement requires INTEGER PRIMARY KEY
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     api_schema_version = Column(String(32), nullable=False)
 
     source = Column(String(32), nullable=False)
@@ -242,10 +246,7 @@ class Signal(Base):
 
 
 class LabelingCandidate(Base):
-    """Daily operator/analyst supplied candidates for next-day limit-up labeling (待打标).
-
-    This dataset is uploaded via UI and is intentionally separate from internal Signals/Decisions.
-    """
+    """Daily operator/analyst supplied candidates for next-day limit-up labeling (待打标)."""
 
     __tablename__ = "labeling_candidates"
 
@@ -274,10 +275,7 @@ class LabelingCandidate(Base):
 # Canonical Schema v1: limit-up candidate pool (input layer)
 # ---------------------------
 
-
 class LimitupPoolBatch(Base):
-    """Daily batch for the external limit-up candidate pool."""
-
     __tablename__ = "limitup_pool_batches"
 
     batch_id = Column(String(64), primary_key=True)
@@ -285,36 +283,28 @@ class LimitupPoolBatch(Base):
     fetch_ts = Column(DateTime(timezone=True), nullable=False, index=True)
     source = Column(String(64), nullable=False, default="EXTERNAL")
 
-    # FETCHED / EDITING / COMMITTED / CANCELLED
-    status = Column(String(16), nullable=False, default="FETCHED", index=True)
+    status = Column(String(16), nullable=False, default="FETCHED", index=True)  # FETCHED/EDITING/COMMITTED/CANCELLED
     filter_rules = Column(JSON, nullable=False, default=dict)
     raw_hash = Column(String(64), nullable=False)
 
-    __table_args__ = (
-        Index("ix_limitup_pool_batches_day_status", "trading_day", "status"),
-    )
+    __table_args__ = (Index("ix_limitup_pool_batches_day_status", "trading_day", "status"),)
 
 
 class LimitupCandidate(Base):
-    """Filtered candidates belonging to a batch."""
-
     __tablename__ = "limitup_candidates"
 
-    # SQLite autoincrement requires INTEGER PRIMARY KEY
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    # MUST be INTEGER PRIMARY KEY in SQLite to autoincrement
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
 
     batch_id = Column(String(64), ForeignKey("limitup_pool_batches.batch_id", ondelete="CASCADE"), nullable=False, index=True)
     symbol = Column(String(32), nullable=False, index=True)
     name = Column(String(128), nullable=False, default="")
 
-    # Operator editable
     p_limit_up = Column(Float, nullable=True)
     p_source = Column(String(32), nullable=False, default="UI")
     edited_ts = Column(DateTime(timezone=True), nullable=True)
 
-    # PENDING_EDIT / READY / DROPPED
-    candidate_status = Column(String(16), nullable=False, default="PENDING_EDIT", index=True)
-
+    candidate_status = Column(String(16), nullable=False, default="PENDING_EDIT", index=True)  # PENDING_EDIT/READY/DROPPED
     raw_json = Column(JSON, nullable=False, default=dict)
 
     __table_args__ = (
@@ -327,13 +317,7 @@ class LimitupCandidate(Base):
 # Runtime settings / versioned pool filter rules
 # ---------------------------
 
-
 class SystemSetting(Base):
-    """Simple key-value settings store.
-
-    Used for "DB 配置"方案：可在前端动态改（管理员设置页）。
-    """
-
     __tablename__ = "system_settings"
 
     key = Column(String(128), primary_key=True)
@@ -342,94 +326,66 @@ class SystemSetting(Base):
 
 
 class PoolFilterRuleSet(Base):
-    """Versioned pool filter rules (方案3：可审计/可追溯).
-
-    Pipeline reads the latest rule set whose effective_ts <= now (Asia/Shanghai).
-    """
-
     __tablename__ = "pool_filter_rule_sets"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     rule_set_id = Column(String(64), nullable=False, unique=True, index=True)
 
-    allowed_prefixes = Column(JSON, nullable=False, default=list)   # e.g. ["0", "6"]
-    allowed_exchanges = Column(JSON, nullable=False, default=list)  # e.g. ["SZ", "SH"]
+    allowed_prefixes = Column(JSON, nullable=False, default=list)
+    allowed_exchanges = Column(JSON, nullable=False, default=list)
 
     effective_ts = Column(DateTime(timezone=True), nullable=False, index=True)
     note = Column(String(256), nullable=False, default="")
 
     created_at = Column(DateTime(timezone=True), nullable=False)
 
-    __table_args__ = (
-        Index("ix_pool_filter_rules_effective", "effective_ts"),
-    )
+    __table_args__ = (Index("ix_pool_filter_rules_effective", "effective_ts"),)
 
 
 class SymbolWatchlist(Base):
-    """Long-lived watchlist for symbols that repeatedly hit the labeling candidate criteria.
-
-    This drives continuous data refresh + dimensional expansion to accumulate '涨停基因' evidence.
-    """
-
     __tablename__ = "symbol_watchlist"
 
     symbol = Column(String(32), primary_key=True)
 
-    # YYYYMMDD (Beijing)
     first_seen_day = Column(String(8), nullable=False, index=True)
     last_seen_day = Column(String(8), nullable=False, index=True)
 
     hit_count = Column(Integer, nullable=False, default=0)
     active = Column(Boolean, nullable=False, default=True)
 
-    # Planner state: stage, last_plan_at, last_snapshot_at, etc.
     planner_state = Column(JSON, nullable=False, default=dict)
-
     next_refresh_at = Column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
-    __table_args__ = (
-        Index("ix_watchlist_active_refresh", "active", "next_refresh_at"),
-    )
+    __table_args__ = (Index("ix_watchlist_active_refresh", "active", "next_refresh_at"),)
 
 
 class SymbolFeatureSnapshot(Base):
-    """Versioned feature snapshots for a symbol, derived from fetched data responses.
-
-    Stored as a time-series for later learning / analysis.
-    """
-
     __tablename__ = "symbol_feature_snapshots"
 
     snapshot_id = Column(String(64), primary_key=True)
 
     symbol = Column(String(32), nullable=False, index=True)
-    feature_set = Column(String(64), nullable=False, default="AUTO")  # AUTO/BASE/EXPAND/...
+    feature_set = Column(String(64), nullable=False, default="AUTO")
     asof_ts = Column(DateTime(timezone=True), nullable=False, index=True)
 
-    # Linkage
-    request_ids = Column(JSON, nullable=False, default=list)  # list[str]
+    request_ids = Column(JSON, nullable=False, default=list)
     planner_version = Column(String(32), nullable=False, default="planner_v1")
 
     features = Column(JSON, nullable=False, default=dict)
 
     created_at = Column(DateTime(timezone=True), nullable=False)
 
-    __table_args__ = (
-        Index("ix_feature_snapshots_symbol_asof", "symbol", "asof_ts"),
-    )
+    __table_args__ = (Index("ix_feature_snapshots_symbol_asof", "symbol", "asof_ts"),)
 
 
 # ---------------------------
-# Canonical Schema v1: normalized module tables (collector outputs)
+# Collector outputs
 # ---------------------------
-
 
 class EquityEODSnapshot(Base):
-    """Daily EOD snapshot (行情) for a symbol."""
-
     __tablename__ = "equity_eod_snapshot"
 
     trading_day = Column(String(8), nullable=False)
@@ -450,7 +406,7 @@ class EquityEODSnapshot(Base):
     is_limit_up_close = Column(Boolean, nullable=True)
 
     source = Column(String(32), nullable=False, default="COLLECTOR")
-    raw_ref = Column(String(128), nullable=True)  # e.g. response sha / request id
+    raw_ref = Column(String(128), nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
@@ -460,8 +416,6 @@ class EquityEODSnapshot(Base):
 
 
 class EquityThemeMap(Base):
-    """Theme/sector mapping for a symbol on a trading day."""
-
     __tablename__ = "equity_theme_map"
 
     trading_day = Column(String(8), nullable=False)
@@ -482,8 +436,6 @@ class EquityThemeMap(Base):
 
 
 class ThemeDailyStats(Base):
-    """Daily stats for a theme/sector."""
-
     __tablename__ = "theme_daily_stats"
 
     trading_day = Column(String(8), nullable=False)
@@ -504,18 +456,12 @@ class ThemeDailyStats(Base):
 
 
 class PipelineStep(Base):
-    """Idempotent pipeline step state per batch.
-
-    This avoids altering the LimitupPoolBatch schema while still making the pipeline
-    'exactly-once' per (batch_id, step_name).
-    """
-
     __tablename__ = "pipeline_steps"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     batch_id = Column(String(64), nullable=False, index=True)
     step_name = Column(String(64), nullable=False, index=True)
-    status = Column(String(16), nullable=False, default="PENDING")  # PENDING/RUNNING/DONE/FAILED
+    status = Column(String(16), nullable=False, default="PENDING")
     detail = Column(JSON, nullable=False, default=dict)
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
@@ -537,7 +483,6 @@ class DecisionBundle(Base):
     reason_code = Column(String(64), nullable=False)
     params = Column(JSON, nullable=False, default=dict)
 
-    # auditability
     request_ids = Column(JSON, nullable=False, default=list)
     model_hash = Column(String(64), nullable=False, default="")
     feature_hash = Column(String(64), nullable=False, default="")
@@ -559,21 +504,16 @@ class DecisionBundle(Base):
     __table_args__ = (Index("ix_decision_symbol_time", "symbol", "created_at"),)
 
 
-# ---------------------------
-# Canonical Schema v1: user-facing decisions + evidence
-# ---------------------------
-
-
 class ModelDecision(Base):
     __tablename__ = "model_decisions"
 
     decision_id = Column(String(64), primary_key=True)
 
-    trading_day = Column(String(8), nullable=False, index=True)   # input day (T+0) YYYYMMDD
-    decision_day = Column(String(8), nullable=False, index=True)  # output day (T+1) YYYYMMDD
+    trading_day = Column(String(8), nullable=False, index=True)
+    decision_day = Column(String(8), nullable=False, index=True)
 
     symbol = Column(String(32), nullable=False, index=True)
-    action = Column(String(8), nullable=False)  # BUY/WATCH/AVOID
+    action = Column(String(8), nullable=False)
     score = Column(Float, nullable=False, default=0.0)
     confidence = Column(Float, nullable=False, default=0.0)
 
@@ -588,7 +528,7 @@ class ModelDecision(Base):
 class DecisionEvidence(Base):
     __tablename__ = "decision_evidence"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     decision_id = Column(String(64), ForeignKey("model_decisions.decision_id", ondelete="CASCADE"), nullable=False, index=True)
 
     reason_code = Column(String(64), nullable=False)
@@ -597,17 +537,15 @@ class DecisionEvidence(Base):
     evidence_fields = Column(JSON, nullable=False, default=dict)
     evidence_refs = Column(JSON, nullable=False, default=dict)
 
-    __table_args__ = (
-        Index("ix_decision_evidence_decision", "decision_id"),
-    )
+    __table_args__ = (Index("ix_decision_evidence_decision", "decision_id"),)
 
 
 class DecisionLabel(Base):
     __tablename__ = "decision_labels"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     decision_id = Column(String(64), ForeignKey("model_decisions.decision_id", ondelete="CASCADE"), nullable=False, index=True)
-    label_day = Column(String(8), nullable=False, index=True)  # YYYYMMDD
+    label_day = Column(String(8), nullable=False, index=True)
 
     hit_limitup = Column(Boolean, nullable=False, default=False)
     close_return = Column(Float, nullable=False, default=0.0)
@@ -615,15 +553,13 @@ class DecisionLabel(Base):
     drawdown = Column(Float, nullable=False, default=0.0)
     error_tags = Column(JSON, nullable=False, default=list)
 
-    __table_args__ = (
-        UniqueConstraint("decision_id", "label_day", name="uq_decision_labels_decision_label_day"),
-    )
+    __table_args__ = (UniqueConstraint("decision_id", "label_day", name="uq_decision_labels_decision_label_day"),)
 
 
 class ModelMetricsDaily(Base):
     __tablename__ = "model_metrics_daily"
 
-    trading_day = Column(String(8), primary_key=True)  # YYYYMMDD
+    trading_day = Column(String(8), primary_key=True)
 
     hit_rate_at_k = Column(Float, nullable=True)
     avg_return_at_k = Column(Float, nullable=True)
@@ -693,7 +629,6 @@ class Order(Base):
     state = Column(String(20), nullable=False, default="CREATED")
     version_id = Column(Integer, nullable=False, default=1)
 
-    # Spec-required: last_transition_id gate
     last_transition_id = Column(String(64), nullable=True)
 
     strategy_contract_hash = Column(String(64), nullable=False)
@@ -709,7 +644,7 @@ class Order(Base):
 
 class OrderTransition(Base):
     __tablename__ = "order_transitions"
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     cid = Column(String(64), ForeignKey("orders.cid", ondelete="CASCADE"), nullable=False, index=True)
     transition_id = Column(String(64), nullable=False)
     from_state = Column(String(20), nullable=False)
@@ -736,15 +671,13 @@ class OrderAnchor(Base):
 
     created_at = Column(DateTime(timezone=True), nullable=False)
 
-    __table_args__ = (
-        Index("ix_order_anchor_broker", "broker_order_id"),
-    )
+    __table_args__ = (Index("ix_order_anchor_broker", "broker_order_id"),)
 
 
 class TradeFill(Base):
     __tablename__ = "trade_fills"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     broker_fill_id = Column(String(128), nullable=False, unique=True)
 
     cid = Column(String(64), nullable=True, index=True)
@@ -813,7 +746,7 @@ class ReconcileDecision(Base):
 class OutboxEvent(Base):
     __tablename__ = "outbox_events"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     event_type = Column(String(64), nullable=False, index=True)
     dedupe_key = Column(String(128), nullable=False, unique=True)
 
@@ -845,7 +778,7 @@ class PortfolioPosition(Base):
 
 class TradeLog(Base):
     __tablename__ = "trade_log"
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     correlation_id = Column(String(64), nullable=False, index=True)
     cid = Column(String(64), nullable=True, index=True)
     account_id = Column(String(32), nullable=True, index=True)
@@ -867,7 +800,7 @@ class T1Constraint(Base):
 class TrainingFeatureRow(Base):
     __tablename__ = "training_feature_store"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     symbol = Column(String(32), nullable=False, index=True)
 
     data_ts = Column(DateTime(timezone=True), nullable=False)
@@ -906,7 +839,7 @@ class ModelSnapshot(Base):
 class GuardianKey(Base):
     __tablename__ = "guardian_keys"
     key_id = Column(String(64), primary_key=True)
-    role = Column(String(32), nullable=False)  # DEVOPS / RISK_OFFICER / COMPLIANCE
+    role = Column(String(32), nullable=False)
     public_key_b64 = Column(String(512), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked = Column(Boolean, nullable=False, default=False)
@@ -935,7 +868,6 @@ class RuntimeControls(Base):
     __tablename__ = "runtime_controls"
     id = Column(Integer, primary_key=True, default=1)
 
-    # Writable runtime toggles (UI)
     auto_trading_enabled = Column(Boolean, nullable=False, default=False)
     dry_run = Column(Boolean, nullable=False, default=True)
     only_when_data_ok = Column(Boolean, nullable=False, default=True)
@@ -954,7 +886,7 @@ class RuntimeControls(Base):
 class SystemEvent(Base):
     __tablename__ = "system_events"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
     event_type = Column(String(64), nullable=False, index=True)
     severity = Column(String(16), nullable=False, default="INFO")
 
