@@ -299,7 +299,8 @@ class LimitupCandidate(Base):
 
     __tablename__ = "limitup_candidates"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # SQLite 必须用 Integer 主键才能自增（INTEGER PRIMARY KEY）
+    id = Column(Integer, primary_key=True, autoincrement=True)
 
     batch_id = Column(String(64), ForeignKey("limitup_pool_batches.batch_id", ondelete="CASCADE"), nullable=False, index=True)
     symbol = Column(String(32), nullable=False, index=True)
@@ -324,7 +325,6 @@ class LimitupCandidate(Base):
 # ---------------------------
 # Runtime settings / versioned pool filter rules
 # ---------------------------
-
 
 class SystemSetting(Base):
     """Simple key-value settings store.
@@ -423,7 +423,6 @@ class SymbolFeatureSnapshot(Base):
 # ---------------------------
 # Canonical Schema v1: normalized module tables (collector outputs)
 # ---------------------------
-
 
 class EquityEODSnapshot(Base):
     """Daily EOD snapshot (行情) for a symbol."""
@@ -555,11 +554,6 @@ class DecisionBundle(Base):
     created_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (Index("ix_decision_symbol_time", "symbol", "created_at"),)
-
-
-# ---------------------------
-# Canonical Schema v1: user-facing decisions + evidence
-# ---------------------------
 
 
 class ModelDecision(Base):
@@ -826,10 +820,6 @@ class OutboxEvent(Base):
     sent_at = Column(DateTime(timezone=True), nullable=True)
 
 
-# ---------------------------
-# Portfolio / research (minimal placeholders)
-# ---------------------------
-
 class PortfolioPosition(Base):
     __tablename__ = "portfolio_positions"
     account_id = Column(String(32), primary_key=True)
@@ -933,7 +923,6 @@ class RuntimeControls(Base):
     __tablename__ = "runtime_controls"
     id = Column(Integer, primary_key=True, default=1)
 
-    # Writable runtime toggles (UI)
     auto_trading_enabled = Column(Boolean, nullable=False, default=False)
     dry_run = Column(Boolean, nullable=False, default=True)
     only_when_data_ok = Column(Boolean, nullable=False, default=True)
