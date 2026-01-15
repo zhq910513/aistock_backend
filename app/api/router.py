@@ -386,7 +386,6 @@ def update_pool_candidate(batch_id: str, symbol: str, payload: dict = Body(...))
         if b is not None and b.status == "FETCHED":
             b.status = "EDITING"
 
-
         row.p_limit_up = pf
         row.p_source = str(payload.get("p_source") or "UI")
         row.edited_ts = now_shanghai()
@@ -415,7 +414,6 @@ def commit_pool_batch(batch_id: str) -> dict:
             raise HTTPException(status_code=404, detail="batch_not_found")
         if b.status == "CANCELLED":
             raise HTTPException(status_code=400, detail="batch_cancelled")
-
 
         # Require at least one READY candidate with p_limit_up filled
         ready_cnt = (
@@ -459,33 +457,58 @@ def commit_pool_batch(batch_id: str) -> dict:
 
 
 @router.get("/recommendations")
-def list_recommendations(limit: int = 50, day: str | None = None) -> list[dict]:
+def list_recommendations(
+    limit: int = 50,
+    day: str | None = None,
+    trading_day: str | None = None,
+) -> list[dict]:
     """User-facing recommendations (TopN by score).
 
-    day: decision_day (T+1) in YYYY-MM-DD or YYYYMMDD.
-    If not provided, defaults to tomorrow (relative to Shanghai time).
+    Query priority:
+      1) trading_day=YYYY-MM-DD|YYYYMMDD  -> filter by ModelDecision.trading_day (pool/source day, i.e. T)
+      2) day=YYYY-MM-DD|YYYYMMDD          -> filter by ModelDecision.decision_day (decision day, i.e. T+1)
+      3) no params                         -> latest available decision_day in DB (max), not by time arithmetic
     """
-    if not day:
-        td = trading_day_str(now_shanghai() + timedelta(days=1))
-    else:
-        td, _, _ = _parse_ui_day(day)
-        if not td:
-            raise HTTPException(status_code=400, detail="Invalid day. Use YYYY-MM-DD or YYYYMMDD.")
-        # /_parse_ui_day returns trading_day; for recommendations we interpret as decision_day
-
-    decision_day = td
-
     with SessionLocal() as s:
-        decs = (
-            s.execute(
-                select(models.ModelDecision)
-                .where(models.ModelDecision.decision_day == decision_day)
-                .order_by(models.ModelDecision.score.desc())
-                .limit(limit)
+        # 1) trading_day filter (pool day T)
+        if trading_day:
+            td, _, _ = _parse_ui_day(trading_day)
+            if not td:
+                raise HTTPException(status_code=400, detail="Invalid trading_day. Use YYYY-MM-DD or YYYYMMDD.")
+
+            decs = (
+                s.execute(
+                    select(models.ModelDecision)
+                    .where(models.ModelDecision.trading_day == td)
+                    .order_by(models.ModelDecision.score.desc())
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
+        else:
+            # 2) decision_day filter
+            if day:
+                dd, _, _ = _parse_ui_day(day)
+                if not dd:
+                    raise HTTPException(status_code=400, detail="Invalid day. Use YYYY-MM-DD or YYYYMMDD.")
+                decision_day = dd
+            else:
+                # 3) default: latest available decision_day in DB
+                decision_day = s.execute(select(func.max(models.ModelDecision.decision_day))).scalar_one()
+                if not decision_day:
+                    return []
+
+            decs = (
+                s.execute(
+                    select(models.ModelDecision)
+                    .where(models.ModelDecision.decision_day == decision_day)
+                    .order_by(models.ModelDecision.score.desc())
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
 
         if not decs:
             return []

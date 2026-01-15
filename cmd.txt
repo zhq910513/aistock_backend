@@ -8,5 +8,5 @@ cd /data/backend/aistock_backend/
 git pull
 
 cd /data/compose/aistock
-docker compose -f docker-compose.yml build --no-cache backend
-docker compose -f docker-compose.yml up -d --force-recreate backend
+docker compose build --no-cache
+docker compose up -d
