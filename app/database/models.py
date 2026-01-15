@@ -40,7 +40,7 @@ class Account(Base):
 class RawMarketEvent(Base):
     __tablename__ = "raw_market_events"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    # SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     api_schema_version = Column(String(32), nullable=False)
 
@@ -300,7 +300,7 @@ class LimitupCandidate(Base):
 
     __tablename__ = "limitup_candidates"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    # SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
 
     batch_id = Column(String(64), ForeignKey("limitup_pool_batches.batch_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -349,7 +349,6 @@ class PoolFilterRuleSet(Base):
 
     __tablename__ = "pool_filter_rule_sets"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     rule_set_id = Column(String(64), nullable=False, unique=True, index=True)
 
@@ -513,7 +512,6 @@ class PipelineStep(Base):
 
     __tablename__ = "pipeline_steps"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     batch_id = Column(String(64), nullable=False, index=True)
     step_name = Column(String(64), nullable=False, index=True)
@@ -590,7 +588,6 @@ class ModelDecision(Base):
 class DecisionEvidence(Base):
     __tablename__ = "decision_evidence"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     decision_id = Column(String(64), ForeignKey("model_decisions.decision_id", ondelete="CASCADE"), nullable=False, index=True)
 
@@ -608,7 +605,6 @@ class DecisionEvidence(Base):
 class DecisionLabel(Base):
     __tablename__ = "decision_labels"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     decision_id = Column(String(64), ForeignKey("model_decisions.decision_id", ondelete="CASCADE"), nullable=False, index=True)
     label_day = Column(String(8), nullable=False, index=True)  # YYYYMMDD
@@ -713,7 +709,6 @@ class Order(Base):
 
 class OrderTransition(Base):
     __tablename__ = "order_transitions"
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     cid = Column(String(64), ForeignKey("orders.cid", ondelete="CASCADE"), nullable=False, index=True)
     transition_id = Column(String(64), nullable=False)
@@ -749,7 +744,6 @@ class OrderAnchor(Base):
 class TradeFill(Base):
     __tablename__ = "trade_fills"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     broker_fill_id = Column(String(128), nullable=False, unique=True)
 
@@ -819,7 +813,6 @@ class ReconcileDecision(Base):
 class OutboxEvent(Base):
     __tablename__ = "outbox_events"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     event_type = Column(String(64), nullable=False, index=True)
     dedupe_key = Column(String(128), nullable=False, unique=True)
@@ -852,7 +845,6 @@ class PortfolioPosition(Base):
 
 class TradeLog(Base):
     __tablename__ = "trade_log"
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     correlation_id = Column(String(64), nullable=False, index=True)
     cid = Column(String(64), nullable=True, index=True)
@@ -875,7 +867,6 @@ class T1Constraint(Base):
 class TrainingFeatureRow(Base):
     __tablename__ = "training_feature_store"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String(32), nullable=False, index=True)
 
@@ -963,7 +954,6 @@ class RuntimeControls(Base):
 class SystemEvent(Base):
     __tablename__ = "system_events"
 
-    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
     event_type = Column(String(64), nullable=False, index=True)
     severity = Column(String(16), nullable=False, default="INFO")
