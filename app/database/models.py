@@ -40,7 +40,8 @@ class Account(Base):
 class RawMarketEvent(Base):
     __tablename__ = "raw_market_events"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     api_schema_version = Column(String(32), nullable=False)
 
     source = Column(String(32), nullable=False)
@@ -299,7 +300,7 @@ class LimitupCandidate(Base):
 
     __tablename__ = "limitup_candidates"
 
-    # SQLite 必须用 Integer 主键才能自增（INTEGER PRIMARY KEY）
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
     id = Column(Integer, primary_key=True, autoincrement=True)
 
     batch_id = Column(String(64), ForeignKey("limitup_pool_batches.batch_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -326,6 +327,7 @@ class LimitupCandidate(Base):
 # Runtime settings / versioned pool filter rules
 # ---------------------------
 
+
 class SystemSetting(Base):
     """Simple key-value settings store.
 
@@ -347,7 +349,8 @@ class PoolFilterRuleSet(Base):
 
     __tablename__ = "pool_filter_rule_sets"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     rule_set_id = Column(String(64), nullable=False, unique=True, index=True)
 
     allowed_prefixes = Column(JSON, nullable=False, default=list)   # e.g. ["0", "6"]
@@ -423,6 +426,7 @@ class SymbolFeatureSnapshot(Base):
 # ---------------------------
 # Canonical Schema v1: normalized module tables (collector outputs)
 # ---------------------------
+
 
 class EquityEODSnapshot(Base):
     """Daily EOD snapshot (行情) for a symbol."""
@@ -509,7 +513,8 @@ class PipelineStep(Base):
 
     __tablename__ = "pipeline_steps"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     batch_id = Column(String(64), nullable=False, index=True)
     step_name = Column(String(64), nullable=False, index=True)
     status = Column(String(16), nullable=False, default="PENDING")  # PENDING/RUNNING/DONE/FAILED
@@ -556,6 +561,11 @@ class DecisionBundle(Base):
     __table_args__ = (Index("ix_decision_symbol_time", "symbol", "created_at"),)
 
 
+# ---------------------------
+# Canonical Schema v1: user-facing decisions + evidence
+# ---------------------------
+
+
 class ModelDecision(Base):
     __tablename__ = "model_decisions"
 
@@ -580,7 +590,8 @@ class ModelDecision(Base):
 class DecisionEvidence(Base):
     __tablename__ = "decision_evidence"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     decision_id = Column(String(64), ForeignKey("model_decisions.decision_id", ondelete="CASCADE"), nullable=False, index=True)
 
     reason_code = Column(String(64), nullable=False)
@@ -597,7 +608,8 @@ class DecisionEvidence(Base):
 class DecisionLabel(Base):
     __tablename__ = "decision_labels"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     decision_id = Column(String(64), ForeignKey("model_decisions.decision_id", ondelete="CASCADE"), nullable=False, index=True)
     label_day = Column(String(8), nullable=False, index=True)  # YYYYMMDD
 
@@ -701,7 +713,8 @@ class Order(Base):
 
 class OrderTransition(Base):
     __tablename__ = "order_transitions"
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     cid = Column(String(64), ForeignKey("orders.cid", ondelete="CASCADE"), nullable=False, index=True)
     transition_id = Column(String(64), nullable=False)
     from_state = Column(String(20), nullable=False)
@@ -736,7 +749,8 @@ class OrderAnchor(Base):
 class TradeFill(Base):
     __tablename__ = "trade_fills"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     broker_fill_id = Column(String(128), nullable=False, unique=True)
 
     cid = Column(String(64), nullable=True, index=True)
@@ -805,7 +819,8 @@ class ReconcileDecision(Base):
 class OutboxEvent(Base):
     __tablename__ = "outbox_events"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     event_type = Column(String(64), nullable=False, index=True)
     dedupe_key = Column(String(128), nullable=False, unique=True)
 
@@ -820,6 +835,10 @@ class OutboxEvent(Base):
     sent_at = Column(DateTime(timezone=True), nullable=True)
 
 
+# ---------------------------
+# Portfolio / research (minimal placeholders)
+# ---------------------------
+
 class PortfolioPosition(Base):
     __tablename__ = "portfolio_positions"
     account_id = Column(String(32), primary_key=True)
@@ -833,7 +852,8 @@ class PortfolioPosition(Base):
 
 class TradeLog(Base):
     __tablename__ = "trade_log"
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     correlation_id = Column(String(64), nullable=False, index=True)
     cid = Column(String(64), nullable=True, index=True)
     account_id = Column(String(32), nullable=True, index=True)
@@ -855,7 +875,8 @@ class T1Constraint(Base):
 class TrainingFeatureRow(Base):
     __tablename__ = "training_feature_store"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String(32), nullable=False, index=True)
 
     data_ts = Column(DateTime(timezone=True), nullable=False)
@@ -923,6 +944,7 @@ class RuntimeControls(Base):
     __tablename__ = "runtime_controls"
     id = Column(Integer, primary_key=True, default=1)
 
+    # Writable runtime toggles (UI)
     auto_trading_enabled = Column(Boolean, nullable=False, default=False)
     dry_run = Column(Boolean, nullable=False, default=True)
     only_when_data_ok = Column(Boolean, nullable=False, default=True)
@@ -941,7 +963,8 @@ class RuntimeControls(Base):
 class SystemEvent(Base):
     __tablename__ = "system_events"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: SQLite autoincrement requires INTEGER PRIMARY KEY
+    id = Column(Integer, primary_key=True, autoincrement=True)
     event_type = Column(String(64), nullable=False, index=True)
     severity = Column(String(16), nullable=False, default="INFO")
 
