@@ -8,28 +8,33 @@ This module intentionally separates:
 - Scoring (a lightweight baseline that can be replaced by a trained model later)
 - Persistence with full lineage and evidence for UI traceability
 
+IMPORTANT (compat bridge):
+- The current HTTP APIs and orchestrator still persist into legacy tables
+  (ModelDecision/DecisionEvidence) for UI endpoints.
+- Therefore this module exports `generate_for_batch_v2` and `persist_decisions_v2`
+  with the same signature as v1, implemented as a thin compatibility layer.
+
 NOTE:
-- Current implementation uses a deterministic baseline scorer.
-- When you connect more data sources, replace `score_candidate` and/or feed a trained model.
+- The native v2 run/reco/evidence tables are present, but the API surface is not
+  switched yet. When you switch, you can call `generate_for_batch_run_v2`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import exp, log
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database.models import (
-    LabelingCandidate,
-    LimitupPoolBatch,
-    ModelRecoEvidenceV2,
-    ModelRecoV2,
-    ModelRunV2,
-)
+from app.database import models
+
+
+def _next_day_yyyymmdd(td: str) -> str:
+    dt = datetime.strptime(td, "%Y%m%d")
+    return (dt + timedelta(days=1)).strftime("%Y%m%d")
 
 
 def _sigmoid(x: float) -> float:
@@ -73,9 +78,27 @@ class ScoredCandidate:
     signals: Dict[str, Any]
     evidence: List[Tuple[str, str, Dict[str, Any]]]
 
+@dataclass
+class CandidateView:
+    """A minimal attribute-view for scoring.
+
+    We keep this to decouple scoring from the upstream table schema.
+    """
+
+    symbol: str
+    p_limit_up: float
+    turnover_rate: float = 0.0
+    order_amount: float = 0.0
+    sum_market_value: float = 0.0
+    is_again_limit: int = 0
+    high_days: Any = None
+    limit_up_type: str = ""
+    change_rate: Any = None
+
+
 
 def score_candidate(
-    c: LabelingCandidate,
+    c: models.LabelingCandidate,
     target_low: float,
     target_high: float,
     holding_days: int,
@@ -85,26 +108,27 @@ def score_candidate(
     Uses a small set of fields available in current candidate pool.
 
     When more data is ingested (1m bars / orderbook / sector flow / sentiment),
-    extend this function to consume `feat_intraday_cutoff_v2` etc.
+    extend this function to consume `feat_intraday_cutoff` etc.
     """
 
     symbol = c.symbol
 
     p_limit_up = _to_float(c.p_limit_up, default=0.2) if hasattr(c, "p_limit_up") else 0.2
-    turnover_rate = _to_float(c.turnover_rate, default=0.0)
-    order_amount = _to_float(c.order_amount, default=0.0)
-    mkt = _to_float(c.sum_market_value, default=0.0)
-    is_again = _to_int(c.is_again_limit, default=0)
+    turnover_rate = _to_float(getattr(c, "turnover_rate", 0.0), default=0.0)
+    order_amount = _to_float(getattr(c, "order_amount", 0.0), default=0.0)
+    mkt = _to_float(getattr(c, "sum_market_value", 0.0), default=0.0)
+    is_again = _to_int(getattr(c, "is_again_limit", 0), default=0)
 
     # Parse high_days like "2天2板" -> 2
     high_days = 0
     try:
-        if c.high_days:
-            high_days = int(str(c.high_days).split("天")[0])
+        v = getattr(c, "high_days", None)
+        if v:
+            high_days = int(str(v).split("天")[0])
     except Exception:
         high_days = 0
 
-    limit_up_type = (c.limit_up_type or "").strip()
+    limit_up_type = (getattr(c, "limit_up_type", "") or "").strip()
     is_yizi = 1 if ("一字" in limit_up_type) else 0
 
     # Heuristic log-features
@@ -113,14 +137,6 @@ def score_candidate(
     log_mkt = log(max(mkt, 1.0))
 
     # Score: probability of hitting target return within holding window
-    # Intuition:
-    # - higher p_limit_up helps but is not decisive
-    # - multi-day strength (high_days) helps
-    # - one-word board (一字板) is harder to buy at a decent price -> penalty
-    # - extreme turnover can mean distribution -> mild penalty
-    # - larger liquidity (order_amount) helps execution -> mild positive
-    # - huge market cap tends to move slower -> mild penalty
-    # - "again limit" can imply momentum continuation, but also higher gap risk -> slight positive
     x = (
         -0.8
         + 0.55 * logit_p
@@ -154,8 +170,8 @@ def score_candidate(
         "holding_days": holding_days,
         "expected_max_return": round(exp_max, 6),
         "p_limit_up": round(p_limit_up, 6),
-        "high_days": c.high_days,
-        "limit_up_type": c.limit_up_type,
+        "high_days": getattr(c, "high_days", None),
+        "limit_up_type": getattr(c, "limit_up_type", None),
         "turnover_rate": turnover_rate,
         "order_amount": order_amount,
         "sum_market_value": mkt,
@@ -164,42 +180,61 @@ def score_candidate(
 
     evidence: List[Tuple[str, str, Dict[str, Any]]] = []
 
-    evidence.append((
-        "P_HIT_TARGET_3D",
-        f"三日内达到{int(target_low*100)}%+收益概率（p_hit_target={p_hit:.4f}）",
-        {"p_hit_target": round(p_hit, 6), "holding_days": holding_days, "target_low": target_low, "target_high": target_high},
-    ))
+    evidence.append(
+        (
+            "P_HIT_TARGET_3D",
+            f"三日内达到{int(target_low * 100)}%+收益概率（p_hit_target={p_hit:.4f}）",
+            {
+                "p_hit_target": round(p_hit, 6),
+                "holding_days": holding_days,
+                "target_low": target_low,
+                "target_high": target_high,
+            },
+        )
+    )
 
-    evidence.append((
-        "INPUT_P_LIMIT_UP",
-        f"候选池给出的涨停概率（p_limit_up={p_limit_up:.4f}），仅作为特征之一",
-        {"p_limit_up": round(p_limit_up, 6)},
-    ))
+    evidence.append(
+        (
+            "INPUT_P_LIMIT_UP",
+            f"候选池给出的涨停概率（p_limit_up={p_limit_up:.4f}），仅作为特征之一",
+            {"p_limit_up": round(p_limit_up, 6)},
+        )
+    )
 
-    evidence.append((
-        "MOMENTUM_HIGH_DAYS",
-        f"连板/高标强度：{c.high_days or 'N/A'}",
-        {"high_days": c.high_days},
-    ))
+    evidence.append(
+        (
+            "MOMENTUM_HIGH_DAYS",
+            f"连板/高标强度：{getattr(c, 'high_days', None) or 'N/A'}",
+            {"high_days": getattr(c, "high_days", None)},
+        )
+    )
 
     if limit_up_type:
-        evidence.append((
-            "LIMITUP_TYPE",
-            f"涨停类型：{limit_up_type}（一字板更难买入，模型会降低可交易性评分）" if is_yizi else f"涨停类型：{limit_up_type}",
-            {"limit_up_type": limit_up_type},
-        ))
+        evidence.append(
+            (
+                "LIMITUP_TYPE",
+                (
+                    f"涨停类型：{limit_up_type}（一字板更难买入，模型会降低可交易性评分）"
+                    if is_yizi
+                    else f"涨停类型：{limit_up_type}"
+                ),
+                {"limit_up_type": limit_up_type},
+            )
+        )
 
-    evidence.append((
-        "RAW_SNAPSHOT",
-        "候选池原始字段快照（用于追溯）",
-        {
-            "turnover_rate": turnover_rate,
-            "order_amount": order_amount,
-            "sum_market_value": mkt,
-            "is_again_limit": is_again,
-            "change_rate": c.change_rate,
-        },
-    ))
+    evidence.append(
+        (
+            "RAW_SNAPSHOT",
+            "候选池原始字段快照（用于追溯）",
+            {
+                "turnover_rate": turnover_rate,
+                "order_amount": order_amount,
+                "sum_market_value": mkt,
+                "is_again_limit": is_again,
+                "change_rate": getattr(c, "change_rate", None),
+            },
+        )
+    )
 
     return ScoredCandidate(
         symbol=symbol,
@@ -214,7 +249,11 @@ def score_candidate(
     )
 
 
-def generate_for_batch(
+# ---------------------------
+# Native v2 persistence (NOT yet wired to APIs)
+# ---------------------------
+
+def generate_for_batch_run_v2(
     db: Session,
     batch_id: str,
     model_name: str = "target_return_3d",
@@ -224,18 +263,18 @@ def generate_for_batch(
     target_high: Optional[float] = None,
     holding_days: Optional[int] = None,
 ) -> str:
-    """Generate recommendations for a committed pool batch.
+    """Generate recommendations for a committed pool batch into v2 tables.
 
     Returns: run_id
+
+    This function is intentionally NOT used by current APIs yet.
     """
 
-    batch = db.query(LimitupPoolBatch).filter(LimitupPoolBatch.batch_id == batch_id).first()
+    batch = db.query(models.LimitupPoolBatch).filter(models.LimitupPoolBatch.batch_id == batch_id).first()
     if not batch:
         raise ValueError(f"batch_id not found: {batch_id}")
 
-    # decision_day = batch.trading_day + 1 trading day (T+1). We keep string and let labeling pipeline determine calendar.
-    # For now we store it as the batch's decision_day already computed by batch.
-    decision_day = batch.decision_day
+    decision_day = _next_day_yyyymmdd(batch.trading_day)
 
     if asof_ts is None:
         asof_ts = datetime.utcnow()
@@ -249,9 +288,8 @@ def generate_for_batch(
 
     run_id = f"runv2_{batch_id}_{int(asof_ts.timestamp())}"
 
-    run = ModelRunV2(
+    run = models.ModelRunV2(
         run_id=run_id,
-        batch_id=batch_id,
         model_name=model_name,
         model_version=model_version,
         decision_day=decision_day,
@@ -261,35 +299,52 @@ def generate_for_batch(
         holding_days=holding_days,
         params={
             "source": "limitup_pool",
+            "batch_id": batch.batch_id,
             "batch_trading_day": batch.trading_day,
-            "batch_decision_day": batch.decision_day,
+            "raw_hash": batch.raw_hash,
         },
         label_version=None,
     )
     db.add(run)
     db.flush()
 
-    candidates = (
-        db.query(LabelingCandidate)
-        .filter(LabelingCandidate.batch_id == batch_id)
-        .order_by(LabelingCandidate.candidate_id.asc())
+    rows = (
+        db.query(models.LimitupCandidate)
+        .filter(models.LimitupCandidate.batch_id == batch_id)
+        .filter(models.LimitupCandidate.candidate_status != "DROPPED")
+        .order_by(models.LimitupCandidate.id.asc())
         .all()
     )
+
+    candidates: List[CandidateView] = []
+    for c in rows:
+        raw = dict(c.raw_json or {})
+        candidates.append(
+            CandidateView(
+                symbol=c.symbol,
+                p_limit_up=float(c.p_limit_up or 0.0),
+                turnover_rate=_to_float(raw.get("turnover_rate"), default=0.0),
+                order_amount=_to_float(raw.get("order_amount") or raw.get("order_volume"), default=0.0),
+                sum_market_value=_to_float(raw.get("sum_market_value") or raw.get("currency_value"), default=0.0),
+                is_again_limit=_to_int(raw.get("is_again_limit"), default=0),
+                high_days=raw.get("high_days"),
+                limit_up_type=str(raw.get("limit_up_type") or ""),
+                change_rate=raw.get("change_rate"),
+            )
+        )
 
     scored: List[ScoredCandidate] = [
         score_candidate(c, target_low=target_low, target_high=target_high, holding_days=holding_days)
         for c in candidates
     ]
 
-    # rank by p_hit_target desc, then by score
     scored.sort(key=lambda x: (x.p_hit_target, x.score), reverse=True)
 
-    # Persist top-N for UI (default 10)
     top_n = int(getattr(settings, "RECO_TOP_N", 10) or 10)
     kept = scored[:top_n]
 
     for item in kept:
-        reco = ModelRecoV2(
+        reco = models.ModelRecoV2(
             run_id=run_id,
             symbol=item.symbol,
             action=item.action,
@@ -302,21 +357,53 @@ def generate_for_batch(
             created_ts=asof_ts,
         )
         db.add(reco)
-        db.flush()  # to get reco_id
+        db.flush()
 
         for reason_code, reason_text, fields in item.evidence:
-            ev = ModelRecoEvidenceV2(
+            ev = models.ModelRecoEvidenceV2(
                 reco_id=reco.reco_id,
                 reason_code=reason_code,
                 reason_text=reason_text,
                 evidence_fields=fields,
-                evidence_refs={
-                    "batch_id": batch_id,
-                    "symbol": item.symbol,
-                },
+                evidence_refs={"batch_id": batch_id, "symbol": item.symbol},
                 created_ts=asof_ts,
             )
             db.add(ev)
 
     db.commit()
     return run_id
+
+
+# ---------------------------
+# Compatibility layer for current APIs/orchestrator
+# ---------------------------
+
+# Reuse v1 decision tables for now (ModelDecision / DecisionEvidence)
+from app.core.recommender_v1 import EvidenceItem, RecommendationItem  # noqa: E402
+from app.core import recommender_v1 as _reco_v1  # noqa: E402
+
+
+def generate_for_batch_v2(
+    s: Session,
+    batch: models.LimitupPoolBatch,
+    topn: int | None = None,
+) -> list[RecommendationItem]:
+    """Generate recommendation items (API-compatible).
+
+    Current UI endpoints read from ModelDecision/DecisionEvidence.
+    To keep the container runnable and the endpoints consistent, we delegate to v1.
+
+    When UI switches to v2 tables, replace this with native v2 logic.
+    """
+
+    return _reco_v1.generate_for_batch(s, batch, topn=topn)
+
+
+def persist_decisions_v2(
+    s: Session,
+    batch: models.LimitupPoolBatch,
+    items: list[RecommendationItem],
+) -> None:
+    """Persist decisions/evidence (API-compatible)."""
+
+    _reco_v1.persist_decisions(s, batch, items)

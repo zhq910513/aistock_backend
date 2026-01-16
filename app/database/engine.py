@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from sqlalchemy import create_engine, text
@@ -31,6 +32,29 @@ def _sanitize_database_url(url_str: str) -> str:
     return str(u)
 
 
+def _ensure_sqlite_parent_dir(url_str: str) -> None:
+    """Create parent directory for file-based sqlite URL.
+
+    Without this, container startup can fail with:
+    sqlite3.OperationalError: unable to open database file
+    """
+    u = make_url(url_str)
+    if u.get_backend_name() != "sqlite":
+        return
+
+    db_path = u.database
+    if not db_path:
+        return
+
+    # For sqlite, database may be ':memory:' or a file path.
+    if db_path == ":memory:":
+        return
+
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def init_engine() -> None:
     """Initialize the global SQLAlchemy Engine + bind SessionLocal.
 
@@ -42,6 +66,9 @@ def init_engine() -> None:
 
     raw_url = str(settings.DATABASE_URL).strip()
     url = _sanitize_database_url(raw_url)
+
+    # Ensure sqlite file directory exists BEFORE creating the engine.
+    _ensure_sqlite_parent_dir(url)
 
     connect_args: dict = {}
 
@@ -59,7 +86,7 @@ def init_engine() -> None:
         connect_args=connect_args,
     )
 
-    # Bind the already-imported SessionLocal factory (fixes 'NoneType is not callable').
+    # Bind the already-imported SessionLocal factory.
     SessionLocal.configure(bind=_engine)
 
 

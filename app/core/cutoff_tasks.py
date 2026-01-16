@@ -1,98 +1,120 @@
-"""End-of-day cutoff tasks (15:30 Beijing time).
+"""End-of-day cutoff tasks (15:30 Asia/Shanghai).
 
-This module intentionally does NOT fetch data from external providers.
-It assumes raw payloads and/or labeling candidates were already ingested.
+This module is called by the scheduler endpoint `/tasks/eod_1530`.
 
-At 15:30 the system typically:
-1) Ensures high-frequency facts for the day are ingested (1m bars, ticks, L1 orderbook snapshots).
-2) Materializes a feature snapshot `FeatureIntradayCutoffV2` for each symbol.
-3) Optionally writes `OnlineFeedbackEventV2` for label generation when forward data is available.
+Design goals (P0):
+- Make the "15:30 cutoff" runnable and idempotent.
+- Materialize a per-symbol feature snapshot row for the day so later
+  model runs (or UI trace) have a stable input reference.
 
-External schedulers can call the HTTP endpoint that wraps these functions.
+Important notes:
+- We do NOT fetch external market data here. Collectors/ingestors should have
+  already ingested raw payloads before this task runs.
+- Current schema uses `FeatIntradayCutoff` as the materialized snapshot table.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, time, timezone
+import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.database.engine import SessionLocal
 from app.database import models
+from app.utils.crypto import sha256_hex
+from app.utils.time import now_shanghai, to_shanghai, trading_day_str
 
 
-def _bj_now_iso() -> str:
-    # We keep internal timestamps as epoch/int/UTC where appropriate.
-    # Display formatting is handled on the frontend; however settings.TZ is Asia/Shanghai.
-    return datetime.now(tz=timezone.utc).isoformat()
+def _normalize_trading_day(day: str) -> str:
+    """Accept YYYYMMDD or YYYY-MM-DD; return YYYYMMDD."""
+    d = (day or "").strip()
+    if not d:
+        raise ValueError("trading_day is required")
+    if len(d) == 8 and d.isdigit():
+        return d
+    # allow YYYY-MM-DD
+    dt = datetime.strptime(d, "%Y-%m-%d")
+    return dt.strftime("%Y%m%d")
+
+
+def _cutoff_dt_1530(td_yyyymmdd: str) -> datetime:
+    """Return the 15:30 cutoff datetime in Asia/Shanghai."""
+    base = datetime.strptime(td_yyyymmdd, "%Y%m%d")
+    base = to_shanghai(base)
+    return base.replace(hour=15, minute=30, second=0, microsecond=0)
 
 
 def materialize_feat_intraday_cutoff(
     trading_day: str,
-    cutoff_ts: Optional[int] = None,
+    cutoff_ts: Optional[datetime] = None,
     symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Compute and upsert `FeatureIntradayCutoffV2` rows.
+    """Compute and upsert `FeatIntradayCutoff` rows.
 
     Parameters:
-    - trading_day: 'YYYY-MM-DD' in Asia/Shanghai calendar
-    - cutoff_ts: unix seconds; if not provided, defaults to 'trading_day 15:30' (Asia/Shanghai) converted to epoch.
+    - trading_day: 'YYYYMMDD' or 'YYYY-MM-DD' (treated as Asia/Shanghai calendar)
+    - cutoff_ts: datetime; defaults to trading_day 15:30 (Asia/Shanghai)
     - symbol: optional single symbol filter
 
     Returns summary counters.
     """
 
-    # If caller doesn't pass cutoff_ts, we store a sentinel 15:30 local time encoded as "trading_day".
-    # Downstream can treat cutoff_ts=0 as "15:30 local" until a trading calendar module is added.
-    cutoff_ts = int(cutoff_ts or 0)
+    td = _normalize_trading_day(trading_day)
+    cutoff_dt = to_shanghai(cutoff_ts) if cutoff_ts else _cutoff_dt_1530(td)
 
     with SessionLocal() as s:
-        q = s.query(models.LabelingCandidate).filter(models.LabelingCandidate.trading_day == trading_day)
+        q = s.query(models.LabelingCandidate).filter(models.LabelingCandidate.trading_day == td)
         if symbol:
             q = q.filter(models.LabelingCandidate.symbol == symbol)
         candidates: List[models.LabelingCandidate] = q.all()
 
         upserted = 0
+
         for c in candidates:
-            feats = {
-                "p_limit_up": c.p_limit_up,
-                "price": c.price,
-                "turnover_rate": c.turnover_rate,
-                "order_amount": c.order_amount,
-                "volume": c.volume,
-                "amount": c.amount,
-                "high_days": c.high_days,
-                "is_again_limit": c.is_again_limit,
-                "is_new": c.is_new,
-                "is_yizi": c.is_yizi,
-                "limit_up_type": c.limit_up_type,
-                "limit_up_reason": c.limit_up_reason,
-                "src": "labeling_candidate",
-                "materialized_at_utc": _bj_now_iso(),
+            # P0: store what we have. Later, merge real intraday features here.
+            feats: Dict[str, Any] = {
+                "p_limit_up": float(c.p_limit_up),
+                "name": c.name,
+                "source": c.source,
+                "extra": dict(c.extra or {}),
+                "materialized_at": datetime.utcnow().isoformat(),
             }
 
+            feature_hash = sha256_hex(json.dumps(feats, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+
+            raw_hashes: list[str] = []
+            extra = dict(c.extra or {})
+            if isinstance(extra.get("raw_hashes"), list):
+                raw_hashes = [str(x) for x in extra.get("raw_hashes") if str(x)]
+            elif extra.get("raw_hash"):
+                raw_hashes = [str(extra.get("raw_hash"))]
+
             existing = (
-                s.query(models.FeatureIntradayCutoffV2)
+                s.query(models.FeatIntradayCutoff)
                 .filter(
-                    models.FeatureIntradayCutoffV2.symbol == c.symbol,
-                    models.FeatureIntradayCutoffV2.trading_day == trading_day,
-                    models.FeatureIntradayCutoffV2.cutoff_ts == cutoff_ts,
+                    models.FeatIntradayCutoff.symbol == c.symbol,
+                    models.FeatIntradayCutoff.trading_day == td,
+                    models.FeatIntradayCutoff.cutoff_ts == cutoff_dt,
                 )
                 .one_or_none()
             )
 
             if existing:
+                existing.feature_hash = feature_hash
                 existing.features = feats
+                existing.raw_hashes = raw_hashes
             else:
                 s.add(
-                    models.FeatureIntradayCutoffV2(
+                    models.FeatIntradayCutoff(
                         symbol=c.symbol,
-                        trading_day=trading_day,
-                        cutoff_ts=cutoff_ts,
+                        trading_day=td,
+                        cutoff_ts=cutoff_dt,
+                        feature_hash=feature_hash,
                         features=feats,
-                        created_at=int(datetime.now(tz=timezone.utc).timestamp()),
+                        raw_hashes=raw_hashes,
+                        created_ts=datetime.utcnow(),
                     )
                 )
 
@@ -101,9 +123,17 @@ def materialize_feat_intraday_cutoff(
         s.commit()
 
     return {
-        "trading_day": trading_day,
-        "cutoff_ts": cutoff_ts,
+        "trading_day": td,
+        "cutoff_ts": cutoff_dt.isoformat(),
         "symbol": symbol,
         "candidates": len(candidates),
         "upserted": upserted,
     }
+
+
+def run_eod_cutoff_1530(trading_day: str | None = None) -> Dict[str, Any]:
+    """Entry point for the /tasks/eod_1530 endpoint."""
+
+    td = _normalize_trading_day(trading_day or trading_day_str(now_shanghai()))
+    res = materialize_feat_intraday_cutoff(trading_day=td)
+    return {"task": "eod_1530", **res}
