@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database.models import (
     LabelingCandidate,
-    LimitUpPoolBatch,
+    LimitupPoolBatch,
     ModelRecoEvidenceV2,
     ModelRecoV2,
     ModelRunV2,
@@ -229,7 +229,7 @@ def generate_for_batch(
     Returns: run_id
     """
 
-    batch = db.query(LimitUpPoolBatch).filter(LimitUpPoolBatch.batch_id == batch_id).first()
+    batch = db.query(LimitupPoolBatch).filter(LimitupPoolBatch.batch_id == batch_id).first()
     if not batch:
         raise ValueError(f"batch_id not found: {batch_id}")
 
